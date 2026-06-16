@@ -9,19 +9,37 @@ Current scope:
 - produce connector plans for KubeNyx CSI handoff;
 - produce connector plans for Slurm NFSv4 staging handoff through kernel
   `nfsd`/`exportfs`;
-- keep privileged apply behavior out of scope until storage inputs and
-  access-plane policy are fully defined.
+- apply kernel `nfsd` exports only when the operator explicitly passes
+  `--apply-nfsd` and supplies `FEMTO_GALVOFS_NFSD_CLIENTS`.
 
 The GalvoFS foundation and Storage Inputs V1 local/uploaded path are in place.
 This connector can turn Femto endpoint metadata into concrete CSI and
-NFSD/NFSv4 plans. NFSD apply mode, a real CSI driver, and runtime operators
-remain roadmap work after access-plane policy is settled.
+NFSD/NFSv4 plans. It also has the first guarded NFSD apply mode. A real CSI
+driver, runtime operators, lease-expiry cleanup, and site policy controllers
+remain roadmap work.
 
 Example:
 
 ```bash
 curl -s http://127.0.0.1:8787/v0/runs/${RUN_ID}/galvofs/access-endpoints \
   | cargo run -p galvofs-connector
+```
+
+Dry-run the concrete `exportfs` apply command without mutating host export
+state:
+
+```bash
+export FEMTO_GALVOFS_NFSD_CLIENTS='fd00:1234::/64'
+curl -s http://127.0.0.1:8787/v0/runs/${RUN_ID}/galvofs/access-endpoints \
+  | cargo run -p galvofs-connector -- --apply-nfsd --dry-run
+```
+
+Apply the export on a privileged Linux host:
+
+```bash
+export FEMTO_GALVOFS_NFSD_CLIENTS='fd00:1234::/64'
+curl -s http://127.0.0.1:8787/v0/runs/${RUN_ID}/galvofs/access-endpoints \
+  | cargo run -p galvofs-connector -- --apply-nfsd
 ```
 
 ## NFSD Direction
@@ -34,7 +52,7 @@ Kernel `nfsd` uses the operating system NFS server and export table. It is the
 highest-fidelity path for production NFS behavior, especially on Linux, and it
 will look familiar to Slurm and HPC operators.
 
-The connector currently emits a `galvofs-nfsd` plan with:
+The connector emits a `galvofs-nfsd` plan with:
 
 - a `configureKernelNfsdExport` action;
 - an `exportfs` command template;
@@ -43,7 +61,8 @@ The connector currently emits a `galvofs-nfsd` plan with:
 
 The client selector is intentionally represented as
 `${FEMTO_GALVOFS_NFSD_CLIENTS}` until the Slurm site connector supplies the
-authorized node range. This avoids accidentally planning a broad export.
+authorized node range. Apply mode refuses to run unless this value is set to a
+non-empty, non-wildcard selector without whitespace.
 
 Tradeoffs and guardrails:
 
@@ -53,9 +72,18 @@ Tradeoffs and guardrails:
 - needs careful cleanup on lease expiry and cancellation;
 - is hard to run safely inside local developer tests.
 
-Therefore, the default connector behavior is still **plan only**. A future
-`apply` mode should require an explicit flag, a configured
-`FEMTO_GALVOFS_NFSD_CLIENTS` value, and lease-expiry cleanup wiring.
+Therefore, the default connector behavior remains **plan only**. Apply mode is
+explicit and narrow:
+
+- `--apply-nfsd --dry-run` returns the concrete `exportfs` command report
+  without executing it;
+- `--apply-nfsd` executes `exportfs` without a shell;
+- only `configureKernelNfsdExport` actions are applied;
+- client-side `mountNfs4` actions are reported as skipped because runtime or
+  site operators own client mounts.
+
+Lease-expiry cleanup, export reconciliation, and Slurm/KubeNyx operator wiring
+are still follow-on work.
 
 ### User-Space NFSv4 Service
 
