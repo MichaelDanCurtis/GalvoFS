@@ -293,6 +293,60 @@ fn cli_cleanup_nfsd_dry_run_emits_unexport_report() {
     );
 }
 
+#[test]
+fn cli_cleanup_nfsd_dry_run_reconciles_absent_export_state_file() {
+    let state_path = unique_temp_path("galvofs-empty-exportfs-state");
+    fs::write(&state_path, "").expect("state file should write");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_galvofs-connector"))
+        .arg("--cleanup-nfsd")
+        .arg("--dry-run")
+        .arg("--exportfs-state-file")
+        .arg(&state_path)
+        .env("FEMTO_GALVOFS_NFSD_CLIENTS", "fd00:1234::/64")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("connector CLI should start");
+
+    let input = json!({
+        "runId": "run-123",
+        "accessEndpoints": [{
+            "kind": "nfs4",
+            "server": "galvofs.local",
+            "exportPath": "/exports/lease-123",
+            "uri": "nfs4://galvofs.local/exports/lease-123",
+            "targetPath": "/femto/galvofs",
+            "mountOptions": ["vers=4.2", "hard"],
+            "mountCommand": "mount -t nfs4 -o vers=4.2,hard galvofs.local:/exports/lease-123 /femto/galvofs",
+            "environment": {}
+        }]
+    });
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be open")
+        .write_all(input.to_string().as_bytes())
+        .expect("input should write");
+
+    let output = child.wait_with_output().expect("connector CLI should exit");
+    fs::remove_file(&state_path).expect("state file should remove");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(body["reports"][0]["operation"], "cleanup");
+    assert_eq!(body["reports"][0]["commands"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        body["reports"][0]["observations"][0]["status"],
+        "alreadyAbsent"
+    );
+}
+
 fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

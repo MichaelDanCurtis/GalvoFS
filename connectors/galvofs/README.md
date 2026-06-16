@@ -64,6 +64,9 @@ curl -s http://127.0.0.1:8787/v0/runs/${RUN_ID}/galvofs/access-endpoints \
   | cargo run -p galvofs-connector -- --cleanup-nfsd --dry-run
 ```
 
+Add `--exportfs-state-file PATH` to cleanup dry-runs to no-op when the export
+is already absent.
+
 ## NFSD Direction
 
 The selected NFSv4 direction is kernel `nfsd`.
@@ -103,7 +106,8 @@ explicit and narrow:
   matching exports, and executes needed `exportfs` updates without a shell;
 - `--apply-nfsd --dry-run --exportfs-state-file PATH` reconciles against a
   captured export table for deterministic review and tests;
-- `--cleanup-nfsd` emits or executes `exportfs -u` for the scoped export;
+- `--cleanup-nfsd` emits or executes `exportfs -u` for the scoped export, and
+  can reconcile against an export table to no-op when already absent;
 - only `configureKernelNfsdExport` actions are applied;
 - client-side `mountNfs4` actions are reported as skipped because runtime or
   site operators own client mounts.

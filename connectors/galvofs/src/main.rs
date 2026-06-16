@@ -73,14 +73,37 @@ fn run() -> Result<(), String> {
         CliMode::CleanupNfsd {
             dry_run,
             exportfs_program,
+            exportfs_state_file,
         } => {
             let apply_options = nfsd_apply_options(exportfs_program)?;
-            let reports = NfsdApplyReportsResponse::cleanup_connector_plans(
-                plans.run_id,
-                &plans.plans,
-                &apply_options,
-                dry_run,
-            )
+            let reports = if let Some(path) = exportfs_state_file {
+                let existing = read_exportfs_state_file(path)?;
+                NfsdApplyReportsResponse::cleanup_reconcile_connector_plans(
+                    plans.run_id,
+                    &plans.plans,
+                    &apply_options,
+                    &existing,
+                    dry_run,
+                )
+            } else if dry_run {
+                NfsdApplyReportsResponse::cleanup_connector_plans(
+                    plans.run_id,
+                    &plans.plans,
+                    &apply_options,
+                    true,
+                )
+            } else {
+                let existing =
+                    NfsdExportTable::inspect_with_exportfs(&apply_options.exportfs_program)
+                        .map_err(|error| format!("failed to inspect NFSD exports: {error}"))?;
+                NfsdApplyReportsResponse::cleanup_reconcile_connector_plans(
+                    plans.run_id,
+                    &plans.plans,
+                    &apply_options,
+                    &existing,
+                    false,
+                )
+            }
             .map_err(|error| format!("failed to cleanup GalvoFS NFSD plan: {error}"))?;
             serde_json::to_string_pretty(&reports)
                 .map_err(|error| format!("failed to serialize NFSD apply report: {error}"))?
@@ -106,6 +129,7 @@ enum CliMode {
     CleanupNfsd {
         dry_run: bool,
         exportfs_program: String,
+        exportfs_state_file: Option<PathBuf>,
     },
 }
 
@@ -149,12 +173,10 @@ impl CliOptions {
                 exportfs_state_file,
             }
         } else if cleanup_nfsd {
-            if exportfs_state_file.is_some() {
-                return Err("--exportfs-state-file only applies to --apply-nfsd".into());
-            }
             CliMode::CleanupNfsd {
                 dry_run,
                 exportfs_program,
+                exportfs_state_file,
             }
         } else {
             if dry_run {

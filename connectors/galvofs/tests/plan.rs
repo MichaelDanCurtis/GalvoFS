@@ -225,6 +225,46 @@ fn nfsd_cleanup_report_renders_concrete_unexport_command() {
     );
 }
 
+#[test]
+fn nfsd_cleanup_reconcile_noops_when_export_is_absent() {
+    let plan =
+        ConnectorPlan::from_access_endpoint(nfs_endpoint()).expect("NFS endpoint should plan");
+    let options = NfsdApplyOptions::new("fd00:1234::/64").expect("clients should validate");
+    let existing = NfsdExportTable::empty();
+
+    let report = NfsdApplyReport::cleanup_reconcile_dry_run_from_plan(&plan, &options, &existing)
+        .expect("absent export should reconcile cleanup");
+
+    assert_eq!(report.operation, "cleanup");
+    assert!(report.commands.is_empty());
+    assert_eq!(report.observations.len(), 1);
+    assert_eq!(report.observations[0].status, "alreadyAbsent");
+}
+
+#[test]
+fn nfsd_cleanup_reconcile_unexports_when_export_is_present() {
+    let plan =
+        ConnectorPlan::from_access_endpoint(nfs_endpoint()).expect("NFS endpoint should plan");
+    let options = NfsdApplyOptions::new("fd00:1234::/64").expect("clients should validate");
+    let existing = NfsdExportTable::parse_exportfs_verbose(
+        r#"/exports/lease-123
+        fd00:1234::/64(sync,wdelay,no_subtree_check,sec=sys,rw,root_squash)
+"#,
+    )
+    .expect("export table should parse");
+
+    let report = NfsdApplyReport::cleanup_reconcile_dry_run_from_plan(&plan, &options, &existing)
+        .expect("present export should reconcile cleanup");
+
+    assert_eq!(report.operation, "cleanup");
+    assert_eq!(report.commands.len(), 1);
+    assert_eq!(
+        report.commands[0].display,
+        "exportfs -u fd00:1234::/64:/exports/lease-123"
+    );
+    assert_eq!(report.observations[0].status, "cleanupPlanned");
+}
+
 fn nfs_endpoint() -> GalvoFsAccessEndpoint {
     GalvoFsAccessEndpoint::Nfs4 {
         server: "galvofs.local".into(),

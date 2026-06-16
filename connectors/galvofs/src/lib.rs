@@ -292,6 +292,22 @@ impl NfsdApplyReport {
         Self::cleanup_from_plan_inner(plan, options, false)
     }
 
+    pub fn cleanup_reconcile_dry_run_from_plan(
+        plan: &ConnectorPlan,
+        options: &NfsdApplyOptions,
+        existing: &NfsdExportTable,
+    ) -> Result<Self, ConnectorError> {
+        Self::cleanup_reconcile_from_plan_inner(plan, options, existing, true)
+    }
+
+    pub fn cleanup_reconcile_from_plan(
+        plan: &ConnectorPlan,
+        options: &NfsdApplyOptions,
+        existing: &NfsdExportTable,
+    ) -> Result<Self, ConnectorError> {
+        Self::cleanup_reconcile_from_plan_inner(plan, options, existing, false)
+    }
+
     fn apply_from_plan_inner(
         plan: &ConnectorPlan,
         options: &NfsdApplyOptions,
@@ -459,6 +475,68 @@ impl NfsdApplyReport {
         }
 
         if commands.is_empty() {
+            return Err(ConnectorError::MissingNfsdApplyPlan);
+        }
+
+        Ok(Self {
+            connector: plan.connector.clone(),
+            operation: "cleanup".into(),
+            applied: !dry_run,
+            commands,
+            observations,
+            skipped_actions,
+        })
+    }
+
+    fn cleanup_reconcile_from_plan_inner(
+        plan: &ConnectorPlan,
+        options: &NfsdApplyOptions,
+        existing: &NfsdExportTable,
+        dry_run: bool,
+    ) -> Result<Self, ConnectorError> {
+        if plan.connector != "galvofs-nfsd" {
+            return Err(ConnectorError::MissingNfsdApplyPlan);
+        }
+
+        let mut commands = Vec::new();
+        let mut observations = Vec::new();
+        let mut skipped_actions = Vec::new();
+        for action in &plan.actions {
+            match action {
+                ConnectorAction::ConfigureKernelNfsdExport { export_path, .. } => {
+                    if !is_safe_absolute_path(export_path) {
+                        return Err(ConnectorError::UnsafeNfsdExportPath(export_path.clone()));
+                    }
+                    if existing.has_export(export_path, &options.client_selector) {
+                        let mut report = NfsdCommandReport::unexport(
+                            options.exportfs_program.clone(),
+                            options.client_selector.clone(),
+                            export_path.clone(),
+                        );
+                        if !dry_run {
+                            report.execute()?;
+                        }
+                        observations.push(NfsdExportObservation::new(
+                            "cleanupPlanned",
+                            export_path.clone(),
+                            options.client_selector.clone(),
+                            Vec::new(),
+                        ));
+                        commands.push(report);
+                    } else {
+                        observations.push(NfsdExportObservation::new(
+                            "alreadyAbsent",
+                            export_path.clone(),
+                            options.client_selector.clone(),
+                            Vec::new(),
+                        ));
+                    }
+                }
+                other => skipped_actions.push(other.kind_name().to_string()),
+            }
+        }
+
+        if observations.is_empty() {
             return Err(ConnectorError::MissingNfsdApplyPlan);
         }
 
@@ -698,6 +776,32 @@ impl NfsdApplyReportsResponse {
                     NfsdApplyReport::cleanup_dry_run_from_plan(plan, options)?
                 } else {
                     NfsdApplyReport::cleanup_from_plan(plan, options)?
+                };
+                reports.push(report);
+            }
+        }
+
+        if reports.is_empty() {
+            return Err(ConnectorError::MissingNfsdApplyPlan);
+        }
+
+        Ok(Self { run_id, reports })
+    }
+
+    pub fn cleanup_reconcile_connector_plans(
+        run_id: Option<String>,
+        plans: &[ConnectorPlan],
+        options: &NfsdApplyOptions,
+        existing: &NfsdExportTable,
+        dry_run: bool,
+    ) -> Result<Self, ConnectorError> {
+        let mut reports = Vec::new();
+        for plan in plans {
+            if plan.connector == "galvofs-nfsd" {
+                let report = if dry_run {
+                    NfsdApplyReport::cleanup_reconcile_dry_run_from_plan(plan, options, existing)?
+                } else {
+                    NfsdApplyReport::cleanup_reconcile_from_plan(plan, options, existing)?
                 };
                 reports.push(report);
             }
