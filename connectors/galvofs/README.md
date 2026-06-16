@@ -10,13 +10,15 @@ Current scope:
 - produce connector plans for Slurm NFSv4 staging handoff through kernel
   `nfsd`/`exportfs`;
 - apply kernel `nfsd` exports only when the operator explicitly passes
-  `--apply-nfsd` and supplies `FEMTO_GALVOFS_NFSD_CLIENTS`.
+  `--apply-nfsd` and supplies `FEMTO_GALVOFS_NFSD_CLIENTS`;
+- cleanup kernel `nfsd` exports only when the operator explicitly passes
+  `--cleanup-nfsd`.
 
 The GalvoFS foundation and Storage Inputs V1 local/uploaded path are in place.
 This connector can turn Femto endpoint metadata into concrete CSI and
-NFSD/NFSv4 plans. It also has the first guarded NFSD apply mode. A real CSI
-driver, runtime operators, lease-expiry cleanup, and site policy controllers
-remain roadmap work.
+NFSD/NFSv4 plans. It also has guarded NFSD apply, reconcile, and cleanup
+commands. A real CSI driver, runtime operators, lease-expiry automation, audit
+receipt integration, and site policy controllers remain roadmap work.
 
 Example:
 
@@ -40,6 +42,26 @@ Apply the export on a privileged Linux host:
 export FEMTO_GALVOFS_NFSD_CLIENTS='fd00:1234::/64'
 curl -s http://127.0.0.1:8787/v0/runs/${RUN_ID}/galvofs/access-endpoints \
   | cargo run -p galvofs-connector -- --apply-nfsd
+```
+
+Dry-run reconcile against a captured `exportfs -v` table:
+
+```bash
+export FEMTO_GALVOFS_NFSD_CLIENTS='fd00:1234::/64'
+exportfs -v > /tmp/galvofs-exportfs-state.txt
+curl -s http://127.0.0.1:8787/v0/runs/${RUN_ID}/galvofs/access-endpoints \
+  | cargo run -p galvofs-connector -- \
+      --apply-nfsd \
+      --dry-run \
+      --exportfs-state-file /tmp/galvofs-exportfs-state.txt
+```
+
+Dry-run cleanup for a canceled, expired, or purged lease:
+
+```bash
+export FEMTO_GALVOFS_NFSD_CLIENTS='fd00:1234::/64'
+curl -s http://127.0.0.1:8787/v0/runs/${RUN_ID}/galvofs/access-endpoints \
+  | cargo run -p galvofs-connector -- --cleanup-nfsd --dry-run
 ```
 
 ## NFSD Direction
@@ -77,13 +99,17 @@ explicit and narrow:
 
 - `--apply-nfsd --dry-run` returns the concrete `exportfs` command report
   without executing it;
-- `--apply-nfsd` executes `exportfs` without a shell;
+- `--apply-nfsd` inspects current exports with `exportfs -v`, skips already
+  matching exports, and executes needed `exportfs` updates without a shell;
+- `--apply-nfsd --dry-run --exportfs-state-file PATH` reconciles against a
+  captured export table for deterministic review and tests;
+- `--cleanup-nfsd` emits or executes `exportfs -u` for the scoped export;
 - only `configureKernelNfsdExport` actions are applied;
 - client-side `mountNfs4` actions are reported as skipped because runtime or
   site operators own client mounts.
 
-Lease-expiry cleanup, export reconciliation, and Slurm/KubeNyx operator wiring
-are still follow-on work.
+Lease-expiry automation, audit receipt integration, and Slurm/KubeNyx operator
+wiring are still follow-on work.
 
 ### User-Space NFSv4 Service
 
