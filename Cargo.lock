@@ -504,8 +504,10 @@ name = "galvofs-connector"
 version = "0.1.0"
 dependencies = [
  "galvofs-core",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use galvofs_connector::{ConnectorAction, ConnectorPlan};
+use galvofs_connector::{
+    ConnectorAction, ConnectorPlan, NfsdApplyOptions, NfsdApplyReport, NfsdExportTable,
+};
 use galvofs_core::{
     GalvoFsAccessEndpoint, GalvoFsCsiNodePublish, GalvoFsKubernetesCsiProjection,
     GalvoFsKubernetesCsiVolumeSource, GalvoFsKubernetesVolume, GalvoFsKubernetesVolumeMount,
@@ -104,4 +106,176 @@ fn nfs_endpoint_becomes_kernel_nfsd_connector_plan() {
             },
         ]
     );
+}
+
+#[test]
+fn nfsd_apply_report_renders_concrete_exportfs_command_with_explicit_clients() {
+    let endpoint = GalvoFsAccessEndpoint::Nfs4 {
+        server: "galvofs.local".into(),
+        export_path: "/exports/lease-123".into(),
+        uri: "nfs4://galvofs.local/exports/lease-123".into(),
+        target_path: "/femto/galvofs".into(),
+        mount_options: vec!["vers=4.2".into(), "hard".into()],
+        mount_command:
+            "mount -t nfs4 -o vers=4.2,hard galvofs.local:/exports/lease-123 /femto/galvofs".into(),
+        environment: BTreeMap::new(),
+    };
+    let plan = ConnectorPlan::from_access_endpoint(endpoint).expect("NFS endpoint should plan");
+    let options = NfsdApplyOptions::new("fd00:1234::/64").expect("clients should validate");
+
+    let report =
+        NfsdApplyReport::dry_run_from_plan(&plan, &options).expect("NFS plan should dry-run");
+
+    assert_eq!(report.connector, "galvofs-nfsd");
+    assert!(!report.applied);
+    assert_eq!(report.commands.len(), 1);
+    assert_eq!(report.commands[0].program, "exportfs");
+    assert_eq!(
+        report.commands[0].args,
+        vec![
+            "-o".to_string(),
+            "rw,sync,no_subtree_check,root_squash".to_string(),
+            "fd00:1234::/64:/exports/lease-123".to_string()
+        ]
+    );
+    assert_eq!(
+        report.commands[0].display,
+        "exportfs -o rw,sync,no_subtree_check,root_squash fd00:1234::/64:/exports/lease-123"
+    );
+    assert!(report.commands[0].command_digest.starts_with("sha256:"));
+    assert_eq!(report.skipped_actions, vec!["mountNfs4".to_string()]);
+}
+
+#[test]
+fn nfsd_apply_options_reject_missing_or_wildcard_clients() {
+    assert!(NfsdApplyOptions::new("").is_err());
+    assert!(NfsdApplyOptions::new("   ").is_err());
+    assert!(NfsdApplyOptions::new("*").is_err());
+    assert!(NfsdApplyOptions::new("10.0.0.0/24 other").is_err());
+}
+
+#[test]
+fn nfsd_reconcile_report_noops_when_export_already_matches() {
+    let plan =
+        ConnectorPlan::from_access_endpoint(nfs_endpoint()).expect("NFS endpoint should plan");
+    let options = NfsdApplyOptions::new("fd00:1234::/64").expect("clients should validate");
+    let existing = NfsdExportTable::parse_exportfs_verbose(
+        r#"/exports/lease-123
+        fd00:1234::/64(sync,wdelay,no_subtree_check,sec=sys,rw,root_squash)
+"#,
+    )
+    .expect("export table should parse");
+
+    let report = NfsdApplyReport::reconcile_dry_run_from_plan(&plan, &options, &existing)
+        .expect("matching export should reconcile");
+
+    assert_eq!(report.operation, "reconcile");
+    assert!(report.commands.is_empty());
+    assert_eq!(report.observations.len(), 1);
+    assert_eq!(report.observations[0].status, "alreadyConfigured");
+    assert_eq!(report.observations[0].export_path, "/exports/lease-123");
+    assert_eq!(report.observations[0].client_selector, "fd00:1234::/64");
+}
+
+#[test]
+fn nfsd_reconcile_report_reapplies_when_export_options_drift() {
+    let plan =
+        ConnectorPlan::from_access_endpoint(nfs_endpoint()).expect("NFS endpoint should plan");
+    let options = NfsdApplyOptions::new("fd00:1234::/64").expect("clients should validate");
+    let existing = NfsdExportTable::parse_exportfs_verbose(
+        r#"/exports/lease-123
+        fd00:1234::/64(sync,wdelay,no_subtree_check,sec=sys,rw,no_root_squash)
+"#,
+    )
+    .expect("export table should parse");
+
+    let report = NfsdApplyReport::reconcile_dry_run_from_plan(&plan, &options, &existing)
+        .expect("drifted export should reconcile");
+
+    assert_eq!(report.operation, "reconcile");
+    assert_eq!(report.commands.len(), 1);
+    assert_eq!(
+        report.commands[0].display,
+        "exportfs -o rw,sync,no_subtree_check,root_squash fd00:1234::/64:/exports/lease-123"
+    );
+    assert_eq!(report.observations[0].status, "drifted");
+}
+
+#[test]
+fn nfsd_cleanup_report_renders_concrete_unexport_command() {
+    let plan =
+        ConnectorPlan::from_access_endpoint(nfs_endpoint()).expect("NFS endpoint should plan");
+    let options = NfsdApplyOptions::new("fd00:1234::/64").expect("clients should validate");
+
+    let report =
+        NfsdApplyReport::cleanup_dry_run_from_plan(&plan, &options).expect("cleanup should plan");
+
+    assert_eq!(report.operation, "cleanup");
+    assert_eq!(report.commands.len(), 1);
+    assert_eq!(report.commands[0].program, "exportfs");
+    assert_eq!(
+        report.commands[0].args,
+        vec![
+            "-u".to_string(),
+            "fd00:1234::/64:/exports/lease-123".to_string()
+        ]
+    );
+    assert_eq!(
+        report.commands[0].display,
+        "exportfs -u fd00:1234::/64:/exports/lease-123"
+    );
+    assert!(report.commands[0].command_digest.starts_with("sha256:"));
+}
+
+#[test]
+fn nfsd_cleanup_reconcile_noops_when_export_is_absent() {
+    let plan =
+        ConnectorPlan::from_access_endpoint(nfs_endpoint()).expect("NFS endpoint should plan");
+    let options = NfsdApplyOptions::new("fd00:1234::/64").expect("clients should validate");
+    let existing = NfsdExportTable::empty();
+
+    let report = NfsdApplyReport::cleanup_reconcile_dry_run_from_plan(&plan, &options, &existing)
+        .expect("absent export should reconcile cleanup");
+
+    assert_eq!(report.operation, "cleanup");
+    assert!(report.commands.is_empty());
+    assert_eq!(report.observations.len(), 1);
+    assert_eq!(report.observations[0].status, "alreadyAbsent");
+}
+
+#[test]
+fn nfsd_cleanup_reconcile_unexports_when_export_is_present() {
+    let plan =
+        ConnectorPlan::from_access_endpoint(nfs_endpoint()).expect("NFS endpoint should plan");
+    let options = NfsdApplyOptions::new("fd00:1234::/64").expect("clients should validate");
+    let existing = NfsdExportTable::parse_exportfs_verbose(
+        r#"/exports/lease-123
+        fd00:1234::/64(sync,wdelay,no_subtree_check,sec=sys,rw,root_squash)
+"#,
+    )
+    .expect("export table should parse");
+
+    let report = NfsdApplyReport::cleanup_reconcile_dry_run_from_plan(&plan, &options, &existing)
+        .expect("present export should reconcile cleanup");
+
+    assert_eq!(report.operation, "cleanup");
+    assert_eq!(report.commands.len(), 1);
+    assert_eq!(
+        report.commands[0].display,
+        "exportfs -u fd00:1234::/64:/exports/lease-123"
+    );
+    assert_eq!(report.observations[0].status, "cleanupPlanned");
+}
+
+fn nfs_endpoint() -> GalvoFsAccessEndpoint {
+    GalvoFsAccessEndpoint::Nfs4 {
+        server: "galvofs.local".into(),
+        export_path: "/exports/lease-123".into(),
+        uri: "nfs4://galvofs.local/exports/lease-123".into(),
+        target_path: "/femto/galvofs".into(),
+        mount_options: vec!["vers=4.2".into(), "hard".into()],
+        mount_command:
+            "mount -t nfs4 -o vers=4.2,hard galvofs.local:/exports/lease-123 /femto/galvofs".into(),
+        environment: BTreeMap::new(),
+    }
 }

@@ -7,11 +7,12 @@ Decision note for the shared Femto and Galvo filesystem subsystem.
 The current milestone is **GalvoFS foundation plus Storage Inputs V1 local
 data path**: Femto has the core local GalvoFS storage model, runtime bindings,
 artifact/snapshot records, connector-ready CSI and NFSv4 endpoint metadata, a
-plan-only GalvoFS connector, local-path import behind explicit allowlists, and
-uploaded-object promotion into workspaces. Production access-plane apply work,
-including NFSD mutation, a real CSI driver, runtime operators, S3/site input
-adapters, writeback, and data-lake shims, remains on the roadmap after the V1
-contract is exercised.
+GalvoFS connector with plan generation plus guarded NFSD export apply,
+reconcile, and cleanup modes, local-path import behind explicit allowlists, and
+uploaded-object promotion into workspaces. Production access-plane automation,
+including lease-driven NFSD cleanup, a real CSI driver, runtime operators,
+S3/site input adapters, writeback, and data-lake shims, remains on the roadmap
+after the V1 contract is exercised.
 
 Femto needs a storage substrate for execution workspaces, artifacts,
 checkpoints, mounted inputs, snapshots, and receipts. Galvo needs the same
@@ -399,7 +400,9 @@ Completed scope:
 - connector-ready KubeNyx CSI endpoint metadata;
 - connector-ready Slurm NFSv4 endpoint metadata;
 - `galvofs-connector` plan generation for KubeNyx CSI and kernel `nfsd`/NFSv4
-  handoff.
+  handoff, plus explicit `--apply-nfsd` export apply mode with dry-run command
+  reports, current export reconciliation, cleanup/unexport reports, and
+  required client allowlists.
 
 ### Current Milestone: Storage Inputs V1
 
@@ -431,8 +434,8 @@ The remaining milestone work should add:
 
 After storage inputs are stable, continue with:
 
-- kernel `nfsd` apply mode with explicit client allowlists, privileged host
-  checks, lease-expiry cleanup, and audit receipts;
+- kernel `nfsd` lease-expiry automation, privileged host checks, export drift
+  monitoring, and audit receipts;
 - a real GalvoFS CSI driver for KubeNyx/Kubernetes consumption;
 - Slurm and KubeNyx production connectors/operators that consume GalvoFS plans
   and apply site policy;

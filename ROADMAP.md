@@ -18,6 +18,14 @@ uploaded-object promotion landed in Femto.
 - Uploaded-object promotion into workspace files.
 - Materialization task records for local/uploaded imports.
 - `galvofs-connector` plan generation for CSI and kernel `nfsd`/NFSv4 handoff.
+- Guarded `galvofs-connector --apply-nfsd` mode that requires
+  `FEMTO_GALVOFS_NFSD_CLIENTS`, executes `exportfs` without a shell, and
+  supports dry-run command reports.
+- NFSD export reconciliation and cleanup support in `galvofs-connector`,
+  including `exportfs -v` state parsing, already-configured no-op reports,
+  drifted export updates, and `--cleanup-nfsd` unexport reports.
+- SHA-256 command digests in NFSD apply/cleanup reports for receipt-ready
+  command evidence.
 
 ## Next Work
 
@@ -27,7 +35,7 @@ uploaded-object promotion landed in Femto.
 2. Writeback design before implementation.
 3. S3-prefix import/reference/mirror design before implementation.
 4. Site filesystem reference design before implementation.
-5. Production NFSv4 apply plane.
+5. Production NFSv4 lease-expiry automation, audit receipts, and site policy.
 6. Real CSI driver.
 7. Galvo-facing workspace/evidence integration.
 
