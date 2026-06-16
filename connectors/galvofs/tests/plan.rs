@@ -142,6 +142,7 @@ fn nfsd_apply_report_renders_concrete_exportfs_command_with_explicit_clients() {
         report.commands[0].display,
         "exportfs -o rw,sync,no_subtree_check,root_squash fd00:1234::/64:/exports/lease-123"
     );
+    assert!(report.commands[0].command_digest.starts_with("sha256:"));
     assert_eq!(report.skipped_actions, vec!["mountNfs4".to_string()]);
 }
 
@@ -223,6 +224,7 @@ fn nfsd_cleanup_report_renders_concrete_unexport_command() {
         report.commands[0].display,
         "exportfs -u fd00:1234::/64:/exports/lease-123"
     );
+    assert!(report.commands[0].command_digest.starts_with("sha256:"));
 }
 
 #[test]

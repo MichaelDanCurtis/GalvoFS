@@ -178,6 +178,10 @@ fn cli_apply_nfsd_dry_run_emits_exportfs_report() {
     assert_eq!(body["reports"][0]["connector"], "galvofs-nfsd");
     assert_eq!(body["reports"][0]["applied"], false);
     assert_eq!(body["reports"][0]["commands"][0]["program"], "exportfs");
+    assert!(body["reports"][0]["commands"][0]["commandDigest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
     assert_eq!(
         body["reports"][0]["commands"][0]["args"][2],
         "fd00:1234::/64:/exports/lease-123"

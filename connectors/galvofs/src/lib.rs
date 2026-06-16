@@ -2,6 +2,7 @@
 
 use galvofs_core::GalvoFsAccessEndpoint;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::process::Command;
 
@@ -71,6 +72,7 @@ pub struct NfsdExportObservation {
 pub struct NfsdCommandReport {
     pub program: String,
     pub args: Vec<String>,
+    pub command_digest: String,
     pub display: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<i32>,
@@ -580,9 +582,11 @@ impl NfsdCommandReport {
             format!("{client_selector}:{export_path}"),
         ];
         let display = command_display(&program, &args);
+        let command_digest = command_digest(&program, &args);
         Self {
             program,
             args,
+            command_digest,
             display,
             status: None,
             stdout: String::new(),
@@ -593,9 +597,11 @@ impl NfsdCommandReport {
     fn unexport(program: String, client_selector: String, export_path: String) -> Self {
         let args = vec!["-u".to_string(), format!("{client_selector}:{export_path}")];
         let display = command_display(&program, &args);
+        let command_digest = command_digest(&program, &args);
         Self {
             program,
             args,
+            command_digest,
             display,
             status: None,
             stdout: String::new(),
@@ -923,4 +929,15 @@ fn command_display(program: &str, args: &[String]) -> String {
         .chain(args.iter().cloned())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn command_digest(program: &str, args: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(program.as_bytes());
+    hasher.update([0]);
+    for arg in args {
+        hasher.update(arg.as_bytes());
+        hasher.update([0]);
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }

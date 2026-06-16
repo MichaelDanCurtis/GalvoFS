@@ -112,6 +112,10 @@ explicit and narrow:
 - client-side `mountNfs4` actions are reported as skipped because runtime or
   site operators own client mounts.
 
+Each NFSD command report includes a SHA-256 `commandDigest` over the executable
+and argv vector so later audit receipts can bind the exact command that was
+planned or executed without embedding host logs as authority.
+
 Lease-expiry automation, audit receipt integration, and Slurm/KubeNyx operator
 wiring are still follow-on work.
 

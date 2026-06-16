@@ -24,6 +24,8 @@ uploaded-object promotion landed in Femto.
 - NFSD export reconciliation and cleanup support in `galvofs-connector`,
   including `exportfs -v` state parsing, already-configured no-op reports,
   drifted export updates, and `--cleanup-nfsd` unexport reports.
+- SHA-256 command digests in NFSD apply/cleanup reports for receipt-ready
+  command evidence.
 
 ## Next Work
 
