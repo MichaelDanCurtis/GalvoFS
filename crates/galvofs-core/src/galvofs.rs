@@ -230,6 +230,125 @@ impl GalvoFs {
         Ok(record)
     }
 
+    /// Write several files as one unit: all of them land, or none of them do.
+    ///
+    /// `write_file` in a loop cannot offer this. A failure on the third of five
+    /// leaves two written and returns an error, so a caller holding a
+    /// multi-file change — a patch, most obviously — has no way to apply it
+    /// without risking a half-applied result it then has to describe honestly.
+    ///
+    /// The shape that makes this work is already here: bodies are
+    /// content-addressed and stored separately from the index, and the index is
+    /// a single document. So every body goes in first, outside the lock, where
+    /// a failure costs nothing — an unreferenced body is reclaimable and an
+    /// identical one is a no-op — and then a single locked, version-checked
+    /// write installs all N records at once.
+    ///
+    /// Duplicate paths are refused rather than resolved. Two entries for one
+    /// path means the caller believes it is writing two files; silently keeping
+    /// the last would report N written when N-1 landed.
+    pub async fn commit_files(
+        &self,
+        workspace_id: &str,
+        files: &[(&str, &[u8])],
+    ) -> GalvoFsResult<Vec<GalvoFsFileRecord>> {
+        let records = self.stage_file_bodies(files).await?;
+
+        let _lock = self.lock_workspace(workspace_id).await?;
+        let mut state = self.read_workspace_state(workspace_id).await?;
+        for record in &records {
+            state.files.insert(record.path.clone(), record.clone());
+        }
+        self.commit_workspace_state(&mut state).await?;
+
+        // After the commit, so a receipt never describes a write that was
+        // refused. A receipt-append failure here leaves the commit standing and
+        // the audit trail short, which is the lesser of the two.
+        for record in &records {
+            self.append_receipt(
+                StorageReceipt::new("file.commit")
+                    .for_workspace(&state.root)
+                    .with_path(&record.path)
+                    .with_object_digest(&record.digest),
+            )
+            .await?;
+        }
+        Ok(records)
+    }
+
+    /// `commit_files` against a lease, authorized for write.
+    pub async fn commit_files_with_lease(
+        &self,
+        lease_id: &str,
+        files: &[(&str, &[u8])],
+    ) -> GalvoFsResult<Vec<GalvoFsFileRecord>> {
+        let lease = self
+            .authorize_lease(lease_id, GalvoFsLeaseAction::Write)
+            .await?;
+        let records = self.stage_file_bodies(files).await?;
+
+        let _lock = self.lock_workspace(&lease.workspace_id).await?;
+        let mut state = self.read_workspace_state(&lease.workspace_id).await?;
+        for record in &records {
+            state.files.insert(record.path.clone(), record.clone());
+        }
+        self.commit_workspace_state(&mut state).await?;
+
+        for record in &records {
+            self.append_receipt(
+                StorageReceipt::new("file.commit")
+                    .for_workspace(&state.root)
+                    .with_lease(&lease.lease_id)
+                    .with_path(&record.path)
+                    .with_object_digest(&record.digest),
+            )
+            .await?;
+        }
+        Ok(records)
+    }
+
+    /// Validate every path and store every body, before the lock is taken.
+    ///
+    /// Both validation and body storage happen here so that everything able to
+    /// fail for a reason the caller controls has already failed by the time the
+    /// workspace document is touched.
+    async fn stage_file_bodies(
+        &self,
+        files: &[(&str, &[u8])],
+    ) -> GalvoFsResult<Vec<GalvoFsFileRecord>> {
+        if files.is_empty() {
+            return Err(GalvoFsError::AdmissionRejected(
+                "GalvoFS commit contains no files".into(),
+            ));
+        }
+
+        let mut normalized = Vec::with_capacity(files.len());
+        let mut seen: BTreeMap<String, ()> = BTreeMap::new();
+        for (path, bytes) in files {
+            let path = normalize_galvo_path(path)?;
+            if seen.insert(path.clone(), ()).is_some() {
+                return Err(GalvoFsError::AdmissionRejected(format!(
+                    "GalvoFS commit names {path} more than once"
+                )));
+            }
+            normalized.push((path, *bytes));
+        }
+
+        let mut records = Vec::with_capacity(normalized.len());
+        for (path, bytes) in normalized {
+            let digest = sha256_digest(bytes);
+            let object_uri = self.object_store.put_object(&digest, bytes).await?;
+            records.push(GalvoFsFileRecord {
+                path,
+                kind: GalvoFsFileKind::File,
+                size_bytes: bytes.len() as u64,
+                digest,
+                object_uri,
+            });
+        }
+        Ok(records)
+    }
+
     pub async fn read_file(
         &self,
         workspace_id: &str,

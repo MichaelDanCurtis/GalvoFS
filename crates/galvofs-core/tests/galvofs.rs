@@ -1086,3 +1086,125 @@ async fn galvofs_concurrent_writes_do_not_lose_records() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// A commit lands every file or none of them.
+///
+/// The refusal here is a path that escapes the workspace namespace, which is
+/// reachable through the public API and so lets the all-or-nothing property be
+/// asserted directly rather than inferred. `write_file` in a loop would have
+/// written the two valid files before reaching the bad one.
+#[tokio::test]
+async fn galvofs_refused_commit_writes_none_of_its_files() {
+    let root = test_store_root("commit-refused");
+    let galvofs = GalvoFs::local(&root);
+    let workspace = galvofs
+        .create_workspace(workspace_request("commit-refused-root"))
+        .await
+        .expect("workspace should be created");
+
+    let error = galvofs
+        .commit_files(
+            &workspace.workspace_id,
+            &[
+                ("keep-one.txt", b"one".as_slice()),
+                ("keep-two.txt", b"two".as_slice()),
+                ("../escape.txt", b"escape".as_slice()),
+            ],
+        )
+        .await
+        .expect_err("a commit naming an escaping path should be refused");
+    assert!(
+        format!("{error}").contains("escape") || format!("{error}").contains("path"),
+        "refusal should name the offending path, got: {error}"
+    );
+
+    let files = galvofs
+        .list_files(&workspace.workspace_id)
+        .await
+        .expect("workspace should list");
+    assert!(
+        files.is_empty(),
+        "a refused commit left files behind: {:?}",
+        files.iter().map(|file| &file.path).collect::<Vec<_>>()
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Every file in an accepted commit is present afterwards.
+#[tokio::test]
+async fn galvofs_commit_installs_every_file_together() {
+    let root = test_store_root("commit-all");
+    let galvofs = GalvoFs::local(&root);
+    let workspace = galvofs
+        .create_workspace(workspace_request("commit-all-root"))
+        .await
+        .expect("workspace should be created");
+
+    let records = galvofs
+        .commit_files(
+            &workspace.workspace_id,
+            &[
+                ("src/alpha.rs", b"alpha".as_slice()),
+                ("src/beta.rs", b"beta".as_slice()),
+                ("README.md", b"readme".as_slice()),
+            ],
+        )
+        .await
+        .expect("commit should land");
+    assert_eq!(records.len(), 3);
+
+    let files = galvofs
+        .list_files(&workspace.workspace_id)
+        .await
+        .expect("workspace should list");
+    let mut paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec!["README.md", "src/alpha.rs", "src/beta.rs"]);
+
+    let beta = galvofs
+        .read_file(&workspace.workspace_id, "src/beta.rs")
+        .await
+        .expect("committed file should read back");
+    assert_eq!(beta.bytes, b"beta");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Naming one path twice is a caller mistake, not something to resolve.
+///
+/// Keeping the last write silently would report three files committed when two
+/// landed.
+#[tokio::test]
+async fn galvofs_commit_refuses_duplicate_paths() {
+    let root = test_store_root("commit-duplicate");
+    let galvofs = GalvoFs::local(&root);
+    let workspace = galvofs
+        .create_workspace(workspace_request("commit-duplicate-root"))
+        .await
+        .expect("workspace should be created");
+
+    let error = galvofs
+        .commit_files(
+            &workspace.workspace_id,
+            &[
+                ("same.txt", b"first".as_slice()),
+                ("other.txt", b"other".as_slice()),
+                ("same.txt", b"second".as_slice()),
+            ],
+        )
+        .await
+        .expect_err("a commit naming one path twice should be refused");
+    assert!(
+        format!("{error}").contains("same.txt"),
+        "refusal should name the duplicated path, got: {error}"
+    );
+
+    let files = galvofs
+        .list_files(&workspace.workspace_id)
+        .await
+        .expect("workspace should list");
+    assert!(files.is_empty(), "a refused commit left files behind");
+
+    let _ = std::fs::remove_dir_all(root);
+}
