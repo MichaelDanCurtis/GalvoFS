@@ -981,3 +981,108 @@ async fn galvofs_garbage_collection_purges_only_unreferenced_objects() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+fn local_workspace_state_path(root: &std::path::Path, workspace_id: &str) -> std::path::PathBuf {
+    root.join("metadata")
+        .join("workspaces")
+        .join(format!("{workspace_id}.json"))
+}
+
+/// A metadata document must be REPLACED, never rewritten in place.
+///
+/// Rewriting in place means truncate-then-write, and a crash between those two
+/// leaves torn JSON — which for a workspace document loses the entire file
+/// index rather than one file. Replacement by rename is what makes a reader
+/// see either the whole old document or the whole new one.
+///
+/// Inode identity is the observable consequence: an in-place rewrite keeps the
+/// same inode, a rename installs a different one. The fsync that makes the
+/// replacement durable is not portably observable and is not asserted here.
+#[cfg(unix)]
+#[tokio::test]
+async fn galvofs_metadata_documents_are_replaced_not_rewritten_in_place() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = test_store_root("atomic-replace");
+    let galvofs = GalvoFs::local(&root);
+    let workspace = galvofs
+        .create_workspace(workspace_request("atomic-replace-root"))
+        .await
+        .expect("workspace should be created");
+    let state_path = local_workspace_state_path(&root, &workspace.workspace_id);
+
+    galvofs
+        .write_file(&workspace.workspace_id, "first.txt", b"first")
+        .await
+        .expect("first write should land");
+    let before = std::fs::metadata(&state_path)
+        .expect("workspace document should exist")
+        .ino();
+
+    galvofs
+        .write_file(&workspace.workspace_id, "second.txt", b"second")
+        .await
+        .expect("second write should land");
+    let after = std::fs::metadata(&state_path)
+        .expect("workspace document should still exist")
+        .ino();
+
+    assert_ne!(
+        before, after,
+        "workspace document was rewritten in place; a crash mid-write would tear it"
+    );
+
+    let leftovers: Vec<_> = std::fs::read_dir(root.join("metadata").join("workspaces"))
+        .expect("workspaces directory should be readable")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) != Some("json"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files survived a successful write: {leftovers:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Two concurrent writes to one workspace must both survive.
+///
+/// Every mutation is read-whole-state, modify, write-whole-state. Without a
+/// lock both callers read the same document, each inserts its own record, and
+/// the second write discards the first. The body object survives because
+/// bodies are content-addressed and written separately — it is simply
+/// unreferenced, so the index says the file was never written while garbage
+/// collection quietly reclaims it.
+///
+/// `join!` on the test runtime interleaves the two tasks at their await
+/// points, so this reproduces deterministically rather than by scheduling luck.
+#[tokio::test]
+async fn galvofs_concurrent_writes_do_not_lose_records() {
+    let root = test_store_root("lost-update");
+    let galvofs = GalvoFs::local(&root);
+    let workspace = galvofs
+        .create_workspace(workspace_request("lost-update-root"))
+        .await
+        .expect("workspace should be created");
+
+    let (left, right) = tokio::join!(
+        galvofs.write_file(&workspace.workspace_id, "left.txt", b"left"),
+        galvofs.write_file(&workspace.workspace_id, "right.txt", b"right"),
+    );
+    left.expect("left write should land");
+    right.expect("right write should land");
+
+    let files = galvofs
+        .list_files(&workspace.workspace_id)
+        .await
+        .expect("workspace files should list");
+    let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+
+    assert!(
+        paths.contains(&"left.txt") && paths.contains(&"right.txt"),
+        "a concurrent write was silently discarded; index holds {paths:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
