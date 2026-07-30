@@ -1208,3 +1208,334 @@ async fn galvofs_commit_refuses_duplicate_paths() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Set up a workspace with a local-path directory input already materialized.
+///
+/// Returns the store, the workspace id, the binding, and the source directory.
+async fn writeback_fixture(
+    label: &str,
+    writeback_policy: GalvoFsWritebackPolicy,
+    access: GalvoFsAccessMode,
+) -> (
+    GalvoFs,
+    std::path::PathBuf,
+    String,
+    galvofs_core::GalvoFsStorageInputBinding,
+    std::path::PathBuf,
+) {
+    let root = test_store_root(label);
+    let source_root = root.join("allowed-inputs");
+    let dataset = source_root.join("dataset");
+    std::fs::create_dir_all(dataset.join("nested")).expect("source dirs should create");
+    std::fs::write(dataset.join("train.txt"), b"training rows").expect("source file should write");
+    std::fs::write(dataset.join("nested").join("labels.txt"), b"labels")
+        .expect("nested source file should write");
+
+    let galvofs = GalvoFs::local_with_storage_input_roots(&root, [source_root.clone()]);
+    let workspace = galvofs
+        .create_workspace(workspace_request("writeback-root"))
+        .await
+        .expect("workspace should be created");
+    let input = galvofs
+        .create_storage_input(local_path_import_request(format!(
+            "file://{}",
+            dataset.display()
+        )))
+        .await
+        .expect("local path input should be admitted");
+    let binding = galvofs
+        .attach_storage_input(AttachGalvoStorageInputRequest {
+            workspace_id: workspace.workspace_id.clone(),
+            input_id: input.input_id.clone(),
+            lease_id: None,
+            mount_path: "/workspace/data".into(),
+            materialization: GalvoFsInputMaterialization::Import,
+            access,
+            writeback_policy,
+        })
+        .await
+        .expect("input should materialize");
+
+    (galvofs, root, workspace.workspace_id, binding, dataset)
+}
+
+fn read_source_tree(dataset: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut found = Vec::new();
+    for entry in walk_files(dataset) {
+        let relative = entry
+            .strip_prefix(dataset)
+            .expect("entry should sit under dataset")
+            .to_string_lossy()
+            .into_owned();
+        found.push((
+            relative,
+            std::fs::read(&entry).expect("source file readable"),
+        ));
+    }
+    found.sort();
+    found
+}
+
+fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walk_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// Materialization pins a baseline, which is what makes drift judgeable at all.
+#[tokio::test]
+async fn galvofs_materialization_records_a_writeback_baseline() {
+    let (galvofs, root, workspace_id, binding, _dataset) = writeback_fixture(
+        "writeback-baseline",
+        GalvoFsWritebackPolicy::External,
+        GalvoFsAccessMode::ReadWrite,
+    )
+    .await;
+
+    let baseline_id = binding
+        .baseline_snapshot_id
+        .clone()
+        .expect("materialization should pin a baseline snapshot");
+
+    // The baseline must contain the materialized files — a snapshot taken
+    // before materialization would be empty and silently useless.
+    let diff = galvofs
+        .diff_workspace(&workspace_id, &baseline_id)
+        .await
+        .expect("diff against the baseline should work");
+    assert!(
+        diff.changes.is_empty(),
+        "a freshly materialized workspace should not differ from its own baseline: {:?}",
+        diff.changes
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Every refusal leaves the source byte-for-byte as it was.
+#[tokio::test]
+async fn galvofs_writeback_refusals_never_touch_the_source() {
+    // policy: none
+    let (galvofs, root, workspace_id, binding, dataset) = writeback_fixture(
+        "writeback-refuse-none",
+        GalvoFsWritebackPolicy::None,
+        GalvoFsAccessMode::ReadWrite,
+    )
+    .await;
+    let before = read_source_tree(&dataset);
+    galvofs
+        .write_file(&workspace_id, "data/train.txt", b"changed here")
+        .await
+        .expect("workspace edit should land");
+    let error = galvofs
+        .writeback(&workspace_id, &binding.binding_id, None)
+        .await
+        .expect_err("writebackPolicy none should refuse");
+    assert!(
+        format!("{error}").contains("none"),
+        "refusal should name the policy, got: {error}"
+    );
+    assert_eq!(before, read_source_tree(&dataset), "source was modified");
+    let _ = std::fs::remove_dir_all(root);
+
+    // read-only binding
+    let (galvofs, root, workspace_id, binding, dataset) = writeback_fixture(
+        "writeback-refuse-readonly",
+        GalvoFsWritebackPolicy::External,
+        GalvoFsAccessMode::ReadOnly,
+    )
+    .await;
+    let before = read_source_tree(&dataset);
+    galvofs
+        .write_file(&workspace_id, "data/train.txt", b"changed here")
+        .await
+        .expect("workspace edit should land");
+    let error = galvofs
+        .writeback(&workspace_id, &binding.binding_id, None)
+        .await
+        .expect_err("a read-only binding should refuse");
+    assert!(
+        format!("{error}").contains("read-only"),
+        "refusal should say read-only, got: {error}"
+    );
+    assert_eq!(before, read_source_tree(&dataset), "source was modified");
+    let _ = std::fs::remove_dir_all(root);
+
+    // unknown binding
+    let (galvofs, root, workspace_id, _binding, dataset) = writeback_fixture(
+        "writeback-refuse-unknown",
+        GalvoFsWritebackPolicy::External,
+        GalvoFsAccessMode::ReadWrite,
+    )
+    .await;
+    let before = read_source_tree(&dataset);
+    let error = galvofs
+        .writeback(&workspace_id, "storage-input-binding-nope", None)
+        .await
+        .expect_err("an unknown binding should refuse");
+    assert!(
+        format!("{error}").contains("storage-input-binding-nope"),
+        "refusal should name the binding, got: {error}"
+    );
+    assert_eq!(before, read_source_tree(&dataset), "source was modified");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A source that moved since materialization aborts the WHOLE writeback.
+///
+/// Two files are changed in the workspace and only one drifts at the source.
+/// The clean one must not be written either — pushing it and reporting the
+/// other would be a partial application against storage this system does not
+/// own.
+#[tokio::test]
+async fn galvofs_writeback_refuses_everything_when_the_source_drifted() {
+    let (galvofs, root, workspace_id, binding, dataset) = writeback_fixture(
+        "writeback-drift",
+        GalvoFsWritebackPolicy::External,
+        GalvoFsAccessMode::ReadWrite,
+    )
+    .await;
+
+    galvofs
+        .write_file(&workspace_id, "data/train.txt", b"workspace rows")
+        .await
+        .expect("workspace edit should land");
+    galvofs
+        .write_file(&workspace_id, "data/nested/labels.txt", b"workspace labels")
+        .await
+        .expect("second workspace edit should land");
+
+    // Somebody else edits one of them at the source.
+    std::fs::write(dataset.join("train.txt"), b"someone else got here first")
+        .expect("source edit should write");
+    let before = read_source_tree(&dataset);
+
+    let error = galvofs
+        .writeback(&workspace_id, &binding.binding_id, None)
+        .await
+        .expect_err("drift should refuse the writeback");
+    let message = format!("{error}");
+    assert!(
+        message.contains("data/train.txt"),
+        "refusal should name the drifted path, got: {message}"
+    );
+    assert!(
+        message.contains("Nothing was written"),
+        "refusal should say nothing was written, got: {message}"
+    );
+    assert_eq!(
+        before,
+        read_source_tree(&dataset),
+        "a drifted writeback wrote to the source anyway"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The happy path: changed files reach the source, and the report names them.
+#[tokio::test]
+async fn galvofs_external_writeback_pushes_changed_files_and_reports_them() {
+    let (galvofs, root, workspace_id, binding, dataset) = writeback_fixture(
+        "writeback-external",
+        GalvoFsWritebackPolicy::External,
+        GalvoFsAccessMode::ReadWrite,
+    )
+    .await;
+
+    galvofs
+        .write_file(&workspace_id, "data/train.txt", b"workspace rows")
+        .await
+        .expect("workspace edit should land");
+    galvofs
+        .write_file(&workspace_id, "data/fresh.txt", b"brand new")
+        .await
+        .expect("new workspace file should land");
+
+    let report = galvofs
+        .writeback(&workspace_id, &binding.binding_id, None)
+        .await
+        .expect("writeback should succeed");
+
+    let mut written = report.written_paths.clone();
+    written.sort();
+    assert_eq!(written, vec!["data/fresh.txt", "data/train.txt"]);
+    assert!(report.published_artifacts.is_empty());
+
+    assert_eq!(
+        std::fs::read(dataset.join("train.txt")).expect("pushed file readable"),
+        b"workspace rows"
+    );
+    assert_eq!(
+        std::fs::read(dataset.join("fresh.txt")).expect("new file readable"),
+        b"brand new"
+    );
+    // Untouched files stay untouched.
+    assert_eq!(
+        std::fs::read(dataset.join("nested").join("labels.txt")).expect("readable"),
+        b"labels"
+    );
+    // No writeback temporaries survive a success. Match on the file NAME, not
+    // the whole path — the test store root is itself named
+    // "galvofs-writeback-external-...", so a substring check against the path
+    // matches every file in the tree and asserts nothing.
+    let survivors: Vec<_> = walk_files(&dataset)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("galvofs-writeback"))
+        })
+        .collect();
+    assert!(
+        survivors.is_empty(),
+        "writeback temporaries survived: {survivors:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// PinArtifacts publishes internally and never touches the source.
+#[tokio::test]
+async fn galvofs_pin_artifacts_writeback_publishes_without_touching_the_source() {
+    let (galvofs, root, workspace_id, binding, dataset) = writeback_fixture(
+        "writeback-pin",
+        GalvoFsWritebackPolicy::PinArtifacts,
+        GalvoFsAccessMode::ReadWrite,
+    )
+    .await;
+
+    let before = read_source_tree(&dataset);
+    galvofs
+        .write_file(&workspace_id, "data/train.txt", b"workspace rows")
+        .await
+        .expect("workspace edit should land");
+
+    let report = galvofs
+        .writeback(&workspace_id, &binding.binding_id, None)
+        .await
+        .expect("pin-artifacts writeback should succeed");
+
+    assert!(
+        report.written_paths.is_empty(),
+        "PinArtifacts wrote outward"
+    );
+    assert_eq!(report.published_artifacts.len(), 1);
+    assert_eq!(report.published_artifacts[0].path, "data/train.txt");
+    assert_eq!(
+        before,
+        read_source_tree(&dataset),
+        "PinArtifacts modified the external source"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
