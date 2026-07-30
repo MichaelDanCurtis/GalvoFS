@@ -550,7 +550,13 @@ impl GalvoFs {
             project_id: request.project_id,
             name: request.name,
             source_kind: request.source_kind,
-            source_uri: request.source_uri,
+            // Stored canonical, not as typed. Everything downstream — receipts,
+            // bindings, and any comparison between two inputs — then sees one
+            // spelling per source rather than one per caller.
+            source_uri: normalize_storage_input_source_uri(
+                request.source_kind,
+                &request.source_uri,
+            ),
             materialization: request.materialization,
             access: request.access,
             mount_path: request.mount_path,
@@ -3500,6 +3506,76 @@ fn validate_runtime_mount_path(path: &str) -> GalvoFsResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Reduce a source URI to one canonical spelling.
+///
+/// `file:///data/set`, `/data/set`, and `/data/set/` name the same directory
+/// and were previously stored verbatim as three different inputs. Nothing
+/// downstream could tell they matched, so duplicate detection had nothing to
+/// compare and a receipt trail could show the same source under three strings.
+///
+/// Normalization runs after validation, so it is only ever handed a URI whose
+/// scheme is already correct for its kind.
+fn normalize_storage_input_source_uri(
+    source_kind: GalvoFsStorageInputSourceKind,
+    source_uri: &str,
+) -> String {
+    let trimmed = source_uri.trim();
+    match source_kind {
+        // Canonical form is `file://` plus an absolute path. A bare absolute
+        // path is accepted on the way in and stored in the same shape as one
+        // that arrived with the scheme.
+        GalvoFsStorageInputSourceKind::LocalPath => {
+            let path = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+            format!("file://{}", collapse_uri_path(path))
+        }
+        // A trailing slash is MEANINGFUL on an S3 prefix and is preserved.
+        // `training` also matches `training-old/x`; `training/` does not.
+        // Trimming it would silently widen what the input covers, so only
+        // interior duplicate separators are collapsed.
+        GalvoFsStorageInputSourceKind::S3Prefix => {
+            let rest = trimmed.strip_prefix("s3://").unwrap_or(trimmed);
+            let had_trailing_slash = rest.ends_with('/');
+            let collapsed = collapse_uri_path(rest);
+            let collapsed = collapsed.trim_start_matches('/');
+            if had_trailing_slash && !collapsed.is_empty() {
+                format!("s3://{collapsed}/")
+            } else {
+                format!("s3://{collapsed}")
+            }
+        }
+        GalvoFsStorageInputSourceKind::GalvofsWorkspace
+        | GalvoFsStorageInputSourceKind::UploadedObject => {
+            let rest = trimmed.strip_prefix("galvofs://").unwrap_or(trimmed);
+            format!(
+                "galvofs://{}",
+                collapse_uri_path(rest).trim_start_matches('/')
+            )
+        }
+        // No scheme is pinned for these yet, so reshaping the string would be
+        // inventing a contract the design has not settled. Whitespace only.
+        GalvoFsStorageInputSourceKind::SiteFilesystemReference => trimmed.to_string(),
+    }
+}
+
+/// Collapse repeated separators and drop a trailing one, keeping any leading
+/// separator. `/a//b/` becomes `/a/b`; a lone `/` stays `/`.
+fn collapse_uri_path(path: &str) -> String {
+    let leading = path.starts_with('/');
+    let mut collapsed = String::with_capacity(path.len());
+    if leading {
+        collapsed.push('/');
+    }
+    let mut first = true;
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        if !first {
+            collapsed.push('/');
+        }
+        collapsed.push_str(segment);
+        first = false;
+    }
+    collapsed
 }
 
 fn validate_storage_input_source_uri(
