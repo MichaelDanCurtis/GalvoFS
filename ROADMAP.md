@@ -1,6 +1,6 @@
 # GalvoFS Roadmap
 
-Last updated: 2026-06-15
+Last updated: 2026-07-29
 
 GalvoFS is now its own repo after Storage Inputs V1 for local-path imports and
 uploaded-object promotion landed in Femto.
@@ -32,7 +32,11 @@ uploaded-object promotion landed in Femto.
 1. Storage input policy hardening: source URI normalization, idempotency,
    duplicate detection, structured errors, and explicit verification
    transitions.
-2. Writeback design before implementation.
+2. Writeback — designed in `docs/architecture/galvofs-writeback.md`, not yet
+   implemented. The design starts with metadata substrate integrity, because
+   writeback cannot claim all-or-nothing on a substrate whose document writes
+   are not crash-atomic and which has no lost-update protection. Those two are
+   live defects today, independent of writeback.
 3. S3-prefix import/reference/mirror design before implementation.
 4. Site filesystem reference design before implementation.
 5. Production NFSv4 lease-expiry automation, audit receipts, and site policy.
@@ -43,7 +47,6 @@ uploaded-object promotion landed in Femto.
 
 - S3-prefix default behavior: reference, import, mirror, or mount.
 - Site filesystem references for Slurm/HPC and enterprise filesystems.
-- Writeback semantics and conflict behavior.
 - Data-lake shims: input source, delegated query engine, manifest catalog, or
   writeback target.
 - Metadata HA and multi-owner mode.

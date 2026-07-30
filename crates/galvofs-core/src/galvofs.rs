@@ -10,6 +10,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::error::{GalvoFsError, GalvoFsResult};
@@ -17,6 +18,16 @@ use crate::error::{GalvoFsError, GalvoFsResult};
 const SHA256_PREFIX: &str = "sha256:";
 const MAX_STORAGE_INPUT_FILES: usize = 10_000;
 const MAX_STORAGE_INPUT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// How long a workspace lock may go untouched before another caller breaks it.
+///
+/// A process killed while holding the lock leaves the file behind, and nothing
+/// else can ever mutate that workspace again unless the lock can be broken.
+/// The window is far longer than any legitimate hold, which is a metadata read
+/// and a metadata write.
+const WORKSPACE_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+const WORKSPACE_LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+const WORKSPACE_LOCK_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct GalvoFs {
@@ -137,10 +148,13 @@ impl GalvoFs {
             purpose: request.purpose,
             created_at: OffsetDateTime::now_utc(),
         };
+        // A brand new workspace: no prior document to race with, so this is a
+        // create rather than a read-modify-write and needs no lock.
         let state = WorkspaceState {
             root: workspace.clone(),
             files: BTreeMap::new(),
             storage_inputs: Vec::new(),
+            version: 0,
         };
         self.write_workspace_state(&state).await?;
         self.append_receipt(StorageReceipt::new("workspace.create").for_workspace(&workspace))
@@ -155,9 +169,14 @@ impl GalvoFs {
         bytes: &[u8],
     ) -> GalvoFsResult<GalvoFsFileRecord> {
         let path = normalize_galvo_path(relative_path)?;
-        let mut state = self.read_workspace_state(workspace_id).await?;
         let digest = sha256_digest(bytes);
+        // The body goes in before the lock. It is content-addressed and so
+        // idempotent, an unreferenced one is already reclaimable, and the
+        // object store may be S3 — holding a workspace lock across that would
+        // serialize every writer behind a network round trip.
         let object_uri = self.object_store.put_object(&digest, bytes).await?;
+        let _lock = self.lock_workspace(workspace_id).await?;
+        let mut state = self.read_workspace_state(workspace_id).await?;
         let record = GalvoFsFileRecord {
             path: path.clone(),
             kind: GalvoFsFileKind::File,
@@ -166,7 +185,7 @@ impl GalvoFs {
             object_uri,
         };
         state.files.insert(path, record.clone());
-        self.write_workspace_state(&state).await?;
+        self.commit_workspace_state(&mut state).await?;
         self.append_receipt(
             StorageReceipt::new("file.write")
                 .for_workspace(&state.root)
@@ -187,9 +206,10 @@ impl GalvoFs {
             .authorize_lease(lease_id, GalvoFsLeaseAction::Write)
             .await?;
         let path = normalize_galvo_path(relative_path)?;
-        let mut state = self.read_workspace_state(&lease.workspace_id).await?;
         let digest = sha256_digest(bytes);
         let object_uri = self.object_store.put_object(&digest, bytes).await?;
+        let _lock = self.lock_workspace(&lease.workspace_id).await?;
+        let mut state = self.read_workspace_state(&lease.workspace_id).await?;
         let record = GalvoFsFileRecord {
             path: path.clone(),
             kind: GalvoFsFileKind::File,
@@ -198,7 +218,7 @@ impl GalvoFs {
             object_uri,
         };
         state.files.insert(path, record.clone());
-        self.write_workspace_state(&state).await?;
+        self.commit_workspace_state(&mut state).await?;
         self.append_receipt(
             StorageReceipt::new("file.write")
                 .for_workspace(&state.root)
@@ -208,6 +228,125 @@ impl GalvoFs {
         )
         .await?;
         Ok(record)
+    }
+
+    /// Write several files as one unit: all of them land, or none of them do.
+    ///
+    /// `write_file` in a loop cannot offer this. A failure on the third of five
+    /// leaves two written and returns an error, so a caller holding a
+    /// multi-file change — a patch, most obviously — has no way to apply it
+    /// without risking a half-applied result it then has to describe honestly.
+    ///
+    /// The shape that makes this work is already here: bodies are
+    /// content-addressed and stored separately from the index, and the index is
+    /// a single document. So every body goes in first, outside the lock, where
+    /// a failure costs nothing — an unreferenced body is reclaimable and an
+    /// identical one is a no-op — and then a single locked, version-checked
+    /// write installs all N records at once.
+    ///
+    /// Duplicate paths are refused rather than resolved. Two entries for one
+    /// path means the caller believes it is writing two files; silently keeping
+    /// the last would report N written when N-1 landed.
+    pub async fn commit_files(
+        &self,
+        workspace_id: &str,
+        files: &[(&str, &[u8])],
+    ) -> GalvoFsResult<Vec<GalvoFsFileRecord>> {
+        let records = self.stage_file_bodies(files).await?;
+
+        let _lock = self.lock_workspace(workspace_id).await?;
+        let mut state = self.read_workspace_state(workspace_id).await?;
+        for record in &records {
+            state.files.insert(record.path.clone(), record.clone());
+        }
+        self.commit_workspace_state(&mut state).await?;
+
+        // After the commit, so a receipt never describes a write that was
+        // refused. A receipt-append failure here leaves the commit standing and
+        // the audit trail short, which is the lesser of the two.
+        for record in &records {
+            self.append_receipt(
+                StorageReceipt::new("file.commit")
+                    .for_workspace(&state.root)
+                    .with_path(&record.path)
+                    .with_object_digest(&record.digest),
+            )
+            .await?;
+        }
+        Ok(records)
+    }
+
+    /// `commit_files` against a lease, authorized for write.
+    pub async fn commit_files_with_lease(
+        &self,
+        lease_id: &str,
+        files: &[(&str, &[u8])],
+    ) -> GalvoFsResult<Vec<GalvoFsFileRecord>> {
+        let lease = self
+            .authorize_lease(lease_id, GalvoFsLeaseAction::Write)
+            .await?;
+        let records = self.stage_file_bodies(files).await?;
+
+        let _lock = self.lock_workspace(&lease.workspace_id).await?;
+        let mut state = self.read_workspace_state(&lease.workspace_id).await?;
+        for record in &records {
+            state.files.insert(record.path.clone(), record.clone());
+        }
+        self.commit_workspace_state(&mut state).await?;
+
+        for record in &records {
+            self.append_receipt(
+                StorageReceipt::new("file.commit")
+                    .for_workspace(&state.root)
+                    .with_lease(&lease.lease_id)
+                    .with_path(&record.path)
+                    .with_object_digest(&record.digest),
+            )
+            .await?;
+        }
+        Ok(records)
+    }
+
+    /// Validate every path and store every body, before the lock is taken.
+    ///
+    /// Both validation and body storage happen here so that everything able to
+    /// fail for a reason the caller controls has already failed by the time the
+    /// workspace document is touched.
+    async fn stage_file_bodies(
+        &self,
+        files: &[(&str, &[u8])],
+    ) -> GalvoFsResult<Vec<GalvoFsFileRecord>> {
+        if files.is_empty() {
+            return Err(GalvoFsError::AdmissionRejected(
+                "GalvoFS commit contains no files".into(),
+            ));
+        }
+
+        let mut normalized = Vec::with_capacity(files.len());
+        let mut seen: BTreeMap<String, ()> = BTreeMap::new();
+        for (path, bytes) in files {
+            let path = normalize_galvo_path(path)?;
+            if seen.insert(path.clone(), ()).is_some() {
+                return Err(GalvoFsError::AdmissionRejected(format!(
+                    "GalvoFS commit names {path} more than once"
+                )));
+            }
+            normalized.push((path, *bytes));
+        }
+
+        let mut records = Vec::with_capacity(normalized.len());
+        for (path, bytes) in normalized {
+            let digest = sha256_digest(bytes);
+            let object_uri = self.object_store.put_object(&digest, bytes).await?;
+            records.push(GalvoFsFileRecord {
+                path,
+                kind: GalvoFsFileKind::File,
+                size_bytes: bytes.len() as u64,
+                digest,
+                object_uri,
+            });
+        }
+        Ok(records)
     }
 
     pub async fn read_file(
@@ -442,6 +581,14 @@ impl GalvoFs {
         request.validate()?;
         self.ensure_metadata_dirs().await?;
 
+        // Held across materialization, which mutates the state in place and may
+        // import up to MAX_STORAGE_INPUT_FILES. An import that outruns
+        // WORKSPACE_LOCK_STALE_AFTER can have its lock broken by another
+        // writer; the version check then fails the attach with a Conflict
+        // rather than letting two writers both commit. Wasteful — the imported
+        // bodies are content-addressed and simply become reclaimable — but not
+        // corrupting, and a retry succeeds.
+        let _lock = self.lock_workspace(&request.workspace_id).await?;
         let mut state = self.read_workspace_state(&request.workspace_id).await?;
         let input = self.read_storage_input(&request.input_id).await?;
         if input.tenant_id != state.root.tenant_id || input.project_id != state.root.project_id {
@@ -497,7 +644,7 @@ impl GalvoFs {
                 .cmp(&right.mount_path)
                 .then(left.input_id.cmp(&right.input_id))
         });
-        self.write_workspace_state(&state).await?;
+        self.commit_workspace_state(&mut state).await?;
         self.append_receipt(
             StorageReceipt::new("storage-input.attach")
                 .for_workspace(&state.root)
@@ -637,6 +784,9 @@ impl GalvoFs {
                 .map(|record| (record.path.clone(), record))
                 .collect(),
             storage_inputs: Vec::new(),
+            // The clone is a new workspace under a new id, so its history
+            // starts here rather than continuing the source's.
+            version: 0,
         };
         self.write_workspace_state(&state).await?;
         let clone = WorkspaceClone {
@@ -720,13 +870,14 @@ impl GalvoFs {
         snapshot_id: &str,
     ) -> GalvoFsResult<StorageReceipt> {
         let snapshot = self.read_snapshot(snapshot_id).await?;
+        let _lock = self.lock_workspace(workspace_id).await?;
         let mut state = self.read_workspace_state(workspace_id).await?;
         state.files = snapshot
             .files
             .into_iter()
             .map(|record| (record.path.clone(), record))
             .collect();
-        self.write_workspace_state(&state).await?;
+        self.commit_workspace_state(&mut state).await?;
         let receipt = StorageReceipt::new("workspace.rollback")
             .for_workspace(&state.root)
             .with_snapshot(snapshot_id);
@@ -1234,6 +1385,86 @@ impl GalvoFs {
         write_json(&self.workspace_path(&state.root.workspace_id), state).await
     }
 
+    /// Write a mutated workspace document, refusing if it moved underneath us.
+    ///
+    /// Callers hold the workspace lock across read-modify-write, so the version
+    /// should always match. It is checked anyway: if the lock was broken as
+    /// stale while still genuinely held, this is the only thing standing
+    /// between two writers and a silently discarded record.
+    async fn commit_workspace_state(&self, state: &mut WorkspaceState) -> GalvoFsResult<()> {
+        let workspace_id = state.root.workspace_id.clone();
+        let observed = self.read_workspace_state(&workspace_id).await?.version;
+        if observed != state.version {
+            return Err(GalvoFsError::Conflict(format!(
+                "GalvoFS workspace {workspace_id} changed during this write \
+                 (expected version {}, found {observed})",
+                state.version
+            )));
+        }
+        state.version += 1;
+        self.write_workspace_state(state).await
+    }
+
+    /// Take the exclusive lock guarding a workspace's metadata document.
+    ///
+    /// Every mutation is read-whole-state, modify, write-whole-state. Two
+    /// callers without this both read the same document, each inserts its own
+    /// record, and the second write discards the first — the body object
+    /// survives, unreferenced, so the index claims the file was never written
+    /// while garbage collection quietly reclaims it.
+    ///
+    /// `create_new` is an atomic `O_EXCL` create, which is why this needs no
+    /// locking dependency.
+    async fn lock_workspace(&self, workspace_id: &str) -> GalvoFsResult<WorkspaceLock> {
+        let path = self.workspace_lock_path(workspace_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await.map_err(|error| {
+                GalvoFsError::RuntimeFailed(format!(
+                    "failed to create GalvoFS workspace lock path: {error}"
+                ))
+            })?;
+        }
+
+        let deadline = std::time::Instant::now() + WORKSPACE_LOCK_ACQUIRE_TIMEOUT;
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+            {
+                Ok(mut file) => {
+                    let holder = format!(
+                        "pid={} acquiredAt={}",
+                        std::process::id(),
+                        OffsetDateTime::now_utc()
+                    );
+                    file.write_all(holder.as_bytes()).await.map_err(|error| {
+                        GalvoFsError::RuntimeFailed(format!(
+                            "failed to record GalvoFS workspace lock holder: {error}"
+                        ))
+                    })?;
+                    return Ok(WorkspaceLock { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !break_stale_workspace_lock(&path).await?
+                        && std::time::Instant::now() >= deadline
+                    {
+                        return Err(GalvoFsError::Conflict(format!(
+                            "GalvoFS workspace {workspace_id} is locked by another writer"
+                        )));
+                    }
+                    tokio::time::sleep(WORKSPACE_LOCK_POLL_INTERVAL).await;
+                }
+                Err(error) => {
+                    return Err(GalvoFsError::RuntimeFailed(format!(
+                        "failed to lock GalvoFS workspace {workspace_id}: {error}"
+                    )));
+                }
+            }
+        }
+    }
+
     async fn read_snapshot(&self, snapshot_id: &str) -> GalvoFsResult<SnapshotPin> {
         read_json(&self.snapshot_path(snapshot_id)).await
     }
@@ -1352,6 +1583,12 @@ impl GalvoFs {
 
     fn workspace_path(&self, workspace_id: &str) -> PathBuf {
         self.workspaces_root().join(format!("{workspace_id}.json"))
+    }
+
+    /// The `.lock` extension keeps this out of every directory scan:
+    /// `read_json_dir` admits only `.json`.
+    fn workspace_lock_path(&self, workspace_id: &str) -> PathBuf {
+        self.workspaces_root().join(format!("{workspace_id}.lock"))
     }
 
     fn lease_path(&self, lease_id: &str) -> PathBuf {
@@ -2401,6 +2638,60 @@ struct WorkspaceState {
     files: BTreeMap<String, GalvoFsFileRecord>,
     #[serde(default)]
     storage_inputs: Vec<GalvoFsStorageInputBinding>,
+    /// Bumped on every mutation, and checked before every write.
+    ///
+    /// The workspace lock is what prevents concurrent mutations; this is what
+    /// detects one that happened anyway, which is the case that matters
+    /// because a lock is only as good as every call site remembering to take
+    /// it. Documents written before this field existed deserialize as 0.
+    #[serde(default)]
+    version: u64,
+}
+
+/// Exclusive hold on one workspace's metadata document.
+///
+/// Released on drop with a blocking unlink, so an early return or a panic
+/// cannot strand the lock and wedge the workspace until the stale window
+/// elapses. `Drop` cannot be async and this is a single syscall.
+struct WorkspaceLock {
+    path: PathBuf,
+}
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Remove a workspace lock whose holder is gone, reporting whether it went.
+///
+/// Staleness is judged by the lock file's own modification time rather than
+/// its recorded pid: a pid is not meaningful across containers or hosts, and
+/// this metadata root is reachable from more than one of them.
+async fn break_stale_workspace_lock(path: &Path) -> GalvoFsResult<bool> {
+    let metadata = match fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        // The holder released it between our failed create and this stat.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(GalvoFsError::RuntimeFailed(format!(
+                "failed to stat GalvoFS workspace lock: {error}"
+            )));
+        }
+    };
+    let modified = metadata.modified().map_err(|error| {
+        GalvoFsError::RuntimeFailed(format!("failed to age GalvoFS workspace lock: {error}"))
+    })?;
+    if modified.elapsed().unwrap_or_default() < WORKSPACE_LOCK_STALE_AFTER {
+        return Ok(false);
+    }
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(GalvoFsError::RuntimeFailed(format!(
+            "failed to break stale GalvoFS workspace lock: {error}"
+        ))),
+    }
 }
 
 async fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> GalvoFsResult<T> {
@@ -2454,9 +2745,90 @@ async fn write_json<T: Serialize>(path: &Path, value: &T) -> GalvoFsResult<()> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
         GalvoFsError::RuntimeFailed(format!("failed to encode GalvoFS JSON: {error}"))
     })?;
-    fs::write(path, bytes).await.map_err(|error| {
-        GalvoFsError::RuntimeFailed(format!("failed to write GalvoFS JSON: {error}"))
+    replace_document(path, &bytes).await
+}
+
+/// Replace a metadata document rather than rewriting it in place.
+///
+/// A plain write opens with truncate and then writes, so a crash between those
+/// two leaves torn JSON — and for a workspace document that loses the entire
+/// file index, not the one file being changed. Writing a sibling temporary and
+/// renaming it over the target makes the swap atomic on POSIX: a reader sees
+/// the whole previous document or the whole new one, never the middle.
+///
+/// The temporary carries a `.tmp` extension deliberately. `read_json_dir`
+/// filters on `.json`, so a temporary orphaned by a crash is invisible to every
+/// directory scan instead of being parsed as a malformed record.
+///
+/// Every metadata document in this crate is written through here — workspaces,
+/// leases, storage inputs, bindings, snapshots, artifacts — so they all gain
+/// this together.
+async fn replace_document(path: &Path, bytes: &[u8]) -> GalvoFsResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        GalvoFsError::RuntimeFailed(format!(
+            "GalvoFS metadata path {} has no parent directory",
+            path.display()
+        ))
+    })?;
+    let temporary = parent.join(format!("{}.tmp", Uuid::new_v4()));
+
+    if let Err(error) = write_and_sync(&temporary, bytes).await {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, path).await {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(GalvoFsError::RuntimeFailed(format!(
+            "failed to install GalvoFS metadata document: {error}"
+        )));
+    }
+
+    sync_directory(parent).await
+}
+
+async fn write_and_sync(path: &Path, bytes: &[u8]) -> GalvoFsResult<()> {
+    let mut file = fs::File::create(path).await.map_err(|error| {
+        GalvoFsError::RuntimeFailed(format!(
+            "failed to create GalvoFS metadata temporary: {error}"
+        ))
+    })?;
+    file.write_all(bytes).await.map_err(|error| {
+        GalvoFsError::RuntimeFailed(format!(
+            "failed to write GalvoFS metadata temporary: {error}"
+        ))
+    })?;
+    file.sync_all().await.map_err(|error| {
+        GalvoFsError::RuntimeFailed(format!(
+            "failed to flush GalvoFS metadata temporary: {error}"
+        ))
     })
+}
+
+/// Sync the directory so the rename itself survives a crash.
+///
+/// Renaming is atomic but not automatically durable: after a power loss the
+/// directory entry can be missing even though the file's own bytes were
+/// synced. Opening the directory and syncing it closes that gap.
+#[cfg(unix)]
+async fn sync_directory(path: &Path) -> GalvoFsResult<()> {
+    let directory = fs::File::open(path).await.map_err(|error| {
+        GalvoFsError::RuntimeFailed(format!(
+            "failed to open GalvoFS metadata directory: {error}"
+        ))
+    })?;
+    directory.sync_all().await.map_err(|error| {
+        GalvoFsError::RuntimeFailed(format!(
+            "failed to sync GalvoFS metadata directory: {error}"
+        ))
+    })
+}
+
+/// Directories cannot be opened as files here, so the durability of the
+/// directory entry is weaker. The rename above is still atomic, which is the
+/// property the torn-document guarantee actually rests on.
+#[cfg(not(unix))]
+async fn sync_directory(_path: &Path) -> GalvoFsResult<()> {
+    Ok(())
 }
 
 async fn canonicalize_existing_path(path: &Path) -> GalvoFsResult<PathBuf> {
@@ -2814,5 +3186,82 @@ fn opendal_runtime_error(error: opendal::Error) -> GalvoFsError {
         GalvoFsError::ArtifactMissing(format!("GalvoFS OpenDAL object not found: {error}"))
     } else {
         GalvoFsError::RuntimeFailed(format!("GalvoFS OpenDAL operation failed: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The workspace lock is the preventer; the version field is the detector.
+    ///
+    /// An integration test that races two writers only ever exercises the
+    /// preventer, because the lock stops the second writer from reaching the
+    /// commit with a stale document. That would leave the detector asserted by
+    /// nothing — present, plausible, and never fired. This drives it directly.
+    ///
+    /// It also pins the property the error mapping depends on: a refused commit
+    /// leaves the workspace exactly as it was.
+    #[tokio::test]
+    async fn commit_refuses_a_workspace_that_moved_underneath_it() {
+        let root = std::env::temp_dir().join(format!("galvofs-unit-conflict-{}", Uuid::new_v4()));
+        let galvofs = GalvoFs::local(&root);
+        let workspace = galvofs
+            .create_workspace(CreateGalvoWorkspaceRequest {
+                tenant_id: "tenant-alpha".into(),
+                project_id: "project-research".into(),
+                owner_id: "owner".into(),
+                workspace_name: "conflict".into(),
+                purpose: "agent-compute".into(),
+            })
+            .await
+            .expect("workspace should be created");
+
+        // Take a copy of the document, then let a real write advance it.
+        let mut stale = galvofs
+            .read_workspace_state(&workspace.workspace_id)
+            .await
+            .expect("state should read");
+        galvofs
+            .write_file(&workspace.workspace_id, "landed.txt", b"landed")
+            .await
+            .expect("write should land");
+
+        stale.files.insert(
+            "stale.txt".into(),
+            stale
+                .files
+                .values()
+                .next()
+                .cloned()
+                .unwrap_or(GalvoFsFileRecord {
+                    path: "stale.txt".into(),
+                    kind: GalvoFsFileKind::File,
+                    size_bytes: 0,
+                    digest: format!("{SHA256_PREFIX}0"),
+                    object_uri: "memory://stale".into(),
+                }),
+        );
+        let error = galvofs
+            .commit_workspace_state(&mut stale)
+            .await
+            .expect_err("committing a stale document should be refused");
+        assert!(
+            matches!(error, GalvoFsError::Conflict(_)),
+            "expected a Conflict, got {error:?}"
+        );
+
+        let files = galvofs
+            .list_files(&workspace.workspace_id)
+            .await
+            .expect("workspace should still list");
+        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["landed.txt"],
+            "a refused commit must leave the workspace unchanged"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

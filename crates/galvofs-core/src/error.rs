@@ -15,4 +15,11 @@ pub enum GalvoFsError {
     Expired(String),
     #[error("artifact missing: {0}")]
     ArtifactMissing(String),
+    /// A workspace changed underneath a mutation, so the mutation was refused.
+    ///
+    /// The workspace is unchanged when this is returned. It is a distinct
+    /// variant rather than an admission rejection because it is retryable and
+    /// because callers map the two to different status codes.
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
