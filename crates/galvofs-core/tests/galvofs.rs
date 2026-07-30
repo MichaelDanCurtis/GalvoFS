@@ -1539,3 +1539,74 @@ async fn galvofs_pin_artifacts_writeback_publishes_without_touching_the_source()
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Three spellings of one directory become one stored source URI.
+///
+/// Before normalization these were three inputs whose equality nothing
+/// downstream could see, which is why duplicate detection had nothing to
+/// compare and why one source could appear in the receipt trail under three
+/// different strings.
+#[tokio::test]
+async fn galvofs_storage_input_source_uris_are_stored_canonically() {
+    let root = test_store_root("source-uri-normalize");
+    let source_root = root.join("allowed-inputs");
+    let dataset = source_root.join("dataset");
+    std::fs::create_dir_all(&dataset).expect("source dirs should create");
+
+    let galvofs = GalvoFs::local_with_storage_input_roots(&root, [source_root.clone()]);
+    let canonical = format!("file://{}", dataset.display());
+
+    for spelling in [
+        format!("file://{}", dataset.display()),
+        format!("file://{}/", dataset.display()),
+        format!("{}", dataset.display()),
+        format!("{}/", dataset.display()),
+        format!("file://{}//", dataset.display()),
+    ] {
+        let input = galvofs
+            .create_storage_input(local_path_import_request(spelling.clone()))
+            .await
+            .expect("input should be admitted");
+        assert_eq!(
+            input.source_uri, canonical,
+            "sourceUri {spelling} was not stored canonically"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A trailing slash on an S3 prefix survives normalization.
+///
+/// `s3://bucket/training` also matches `training-old/x`; `s3://bucket/training/`
+/// does not. Trimming it would silently widen what the input covers, so only
+/// interior duplicate separators are collapsed. Local paths are the opposite
+/// case and are trimmed, because a directory is the same with or without it.
+#[tokio::test]
+async fn galvofs_s3_prefix_normalization_preserves_a_meaningful_trailing_slash() {
+    let root = test_store_root("s3-prefix-normalize");
+    let galvofs = GalvoFs::local(&root);
+
+    let mut request = s3_storage_input_request();
+    request.source_uri = "s3://research-data//training//".into();
+    let folder_prefix = galvofs
+        .create_storage_input(request)
+        .await
+        .expect("s3 input should be admitted");
+    assert_eq!(folder_prefix.source_uri, "s3://research-data/training/");
+
+    let mut request = s3_storage_input_request();
+    request.source_uri = "s3://research-data/training".into();
+    let bare_prefix = galvofs
+        .create_storage_input(request)
+        .await
+        .expect("s3 input should be admitted");
+    assert_eq!(bare_prefix.source_uri, "s3://research-data/training");
+
+    assert_ne!(
+        folder_prefix.source_uri, bare_prefix.source_uri,
+        "two prefixes matching different object sets were collapsed into one"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
