@@ -26,17 +26,28 @@ uploaded-object promotion landed in Femto.
   drifted export updates, and `--cleanup-nfsd` unexport reports.
 - SHA-256 command digests in NFSD apply/cleanup reports for receipt-ready
   command evidence.
+- Crash-atomic metadata documents (temp, fsync, rename) and a workspace write
+  lock plus state version, closing a torn-document window and a lost-update
+  race that silently discarded concurrent writes.
+- `commit_files`: several files installed as one unit, all or none.
+- Writeback, designed in `docs/architecture/galvofs-writeback.md` and
+  implemented for local-path sources: a materialization baseline snapshot,
+  explicit invocation only, refusal of the whole push if the source drifted
+  since materialization, per-file temp-and-rename, and a report naming exactly
+  which paths landed. `PinArtifacts` publishes internally instead. The outward
+  push is not atomic across files and does not claim to be — see the design
+  note.
 
 ## Next Work
 
 1. Storage input policy hardening: source URI normalization, idempotency,
    duplicate detection, structured errors, and explicit verification
    transitions.
-2. Writeback — designed in `docs/architecture/galvofs-writeback.md`, not yet
-   implemented. The design starts with metadata substrate integrity, because
-   writeback cannot claim all-or-nothing on a substrate whose document writes
-   are not crash-atomic and which has no lost-update protection. Those two are
-   live defects today, independent of writeback.
+2. Writeback for source kinds beyond local-path. The operation shipped for
+   `LocalPath` only; every other kind refuses by name. `S3Prefix` and
+   `SiteFilesystemReference` cannot be done before their import paths exist
+   (items 3 and 4), because writeback for a source that cannot be read in would
+   be dead code that reads as support.
 3. S3-prefix import/reference/mirror design before implementation.
 4. Site filesystem reference design before implementation.
 5. Production NFSv4 lease-expiry automation, audit receipts, and site policy.

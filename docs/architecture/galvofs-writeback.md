@@ -115,16 +115,23 @@ per the independence rule in `AGENTS.md`.
 ## Baseline for drift detection
 
 Nothing in the crate records what an external source looked like when it was
-materialized. `digest_policy` and `verification_status` exist as labels with no
-stored digest behind them, and `GalvoFsMaterializationTask` counts files and
-bytes without recording any.
+materialized. `GalvoFsMaterializationTask` counts files and bytes without
+recording a single digest, and no binding field holds one either.
 
 On materialization, take a `SnapshotPin` and record `baseline_snapshot_id` on
 `GalvoFsStorageInputBinding`. That is the only new persisted field. Drift is
 then `diff_workspace` against the baseline — an operation that already exists.
-`verification_status` gains a real `Pending -> Verified` transition when the
-baseline is taken and digests confirm under `digest_policy: Required`, which
-retires one of the decorative labels rather than leaving it.
+
+**Correction (2026-07-30).** An earlier revision of this note claimed
+`digest_policy` and `verification_status` were labels with nothing behind them,
+and proposed giving `verification_status` a real transition. That was wrong on
+both counts, and the code disagrees: `storage_input_verification_status` derives
+`Pending` or `Deferred` at creation from the source kind and digest policy,
+successful materialization promotes the binding to `Verified`, and
+`update_storage_input_verification_status` propagates that back to the stored
+input. An existing test already asserted the promotion. `writeback_policy` was
+the only genuinely dead field of the three. The proposed transition was written,
+found to be a duplicate of working code, and removed.
 
 ## The writeback operation
 
@@ -173,7 +180,8 @@ machinery already exists.
 
 With this note, all three `GalvoFsWritebackPolicy` variants have defined
 behavior. Before it, all three were persisted and none was ever read: no
-`match`, no `if`, nowhere in the crate.
+`match`, no `if`, nowhere in the crate. That was true of `writeback_policy`
+alone — see the correction above.
 
 ## Testing
 

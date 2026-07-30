@@ -627,12 +627,20 @@ impl GalvoFs {
             verification_status: input.verification_status,
             retention_policy: input.retention_policy.clone(),
             writeback_policy: request.writeback_policy,
+            baseline_snapshot_id: None,
             attached_at: OffsetDateTime::now_utc(),
         };
 
         if binding.materialization == GalvoFsInputMaterialization::Import {
             self.materialize_storage_input(&mut state, &input, &mut binding)
                 .await?;
+            // Pinned from the IN-MEMORY state, not through `snapshot_workspace`,
+            // which reads from disk and would capture the workspace as it was
+            // before this materialization — a baseline that omits exactly the
+            // files writeback exists to reason about.
+            let baseline = snapshot_from_state(&state, format!("baseline-{}", binding.binding_id));
+            write_json(&self.snapshot_path(&baseline.snapshot_id), &baseline).await?;
+            binding.baseline_snapshot_id = Some(baseline.snapshot_id.clone());
         }
 
         state.storage_inputs.retain(|existing| {
@@ -736,13 +744,7 @@ impl GalvoFs {
         label: impl Into<String>,
     ) -> GalvoFsResult<SnapshotPin> {
         let state = self.read_workspace_state(workspace_id).await?;
-        let snapshot = SnapshotPin {
-            snapshot_id: format!("snap-{}", Uuid::new_v4()),
-            workspace_id: state.root.workspace_id.clone(),
-            label: label.into(),
-            files: state.files.values().cloned().collect(),
-            created_at: OffsetDateTime::now_utc(),
-        };
+        let snapshot = snapshot_from_state(&state, label);
         write_json(&self.snapshot_path(&snapshot.snapshot_id), &snapshot).await?;
         self.append_receipt(
             StorageReceipt::new("workspace.snapshot")
@@ -883,6 +885,220 @@ impl GalvoFs {
             .with_snapshot(snapshot_id);
         self.append_receipt(receipt.clone()).await?;
         Ok(receipt)
+    }
+
+    /// Push what a workspace changed back toward the input it came from.
+    ///
+    /// Every refusal below happens before anything outside this store is
+    /// touched. That ordering is the whole contract: a caller that gets an
+    /// error has a source byte-for-byte as it was, and a caller that gets a
+    /// report has the exact list of what moved.
+    ///
+    /// Explicitly invoked. Nothing is ever pushed outward as a side effect of
+    /// an ordinary workspace write.
+    pub async fn writeback(
+        &self,
+        workspace_id: &str,
+        binding_id: &str,
+        lease_id: Option<&str>,
+    ) -> GalvoFsResult<WritebackReport> {
+        if let Some(lease_id) = lease_id {
+            let lease = self
+                .authorize_lease(lease_id, GalvoFsLeaseAction::Write)
+                .await?;
+            if lease.workspace_id != workspace_id {
+                return Err(GalvoFsError::AdmissionRejected(format!(
+                    "GalvoFS lease {} is not scoped to workspace {workspace_id}",
+                    lease.lease_id
+                )));
+            }
+        }
+
+        let state = self.read_workspace_state(workspace_id).await?;
+        let binding = state
+            .storage_inputs
+            .iter()
+            .find(|candidate| candidate.binding_id == binding_id)
+            .cloned()
+            .ok_or_else(|| {
+                GalvoFsError::ArtifactMissing(format!(
+                    "GalvoFS storage input binding {binding_id} is not attached to workspace \
+                     {workspace_id}"
+                ))
+            })?;
+
+        // A no-op that answers "done" is how a policy field stays dead without
+        // anyone noticing, so `None` refuses out loud.
+        if binding.writeback_policy == GalvoFsWritebackPolicy::None {
+            return Err(GalvoFsError::AdmissionRejected(format!(
+                "GalvoFS storage input binding {binding_id} has writebackPolicy \"none\"; \
+                 nothing was written"
+            )));
+        }
+        if binding.access == GalvoFsAccessMode::ReadOnly {
+            return Err(GalvoFsError::AdmissionRejected(format!(
+                "GalvoFS storage input binding {binding_id} is read-only"
+            )));
+        }
+        let baseline_snapshot_id = binding.baseline_snapshot_id.clone().ok_or_else(|| {
+            GalvoFsError::AdmissionRejected(format!(
+                "GalvoFS storage input binding {binding_id} has no materialization baseline, so \
+                 drift against its source cannot be judged; writeback is refused rather than \
+                 overwriting blind"
+            ))
+        })?;
+
+        let diff = self
+            .diff_workspace(workspace_id, &baseline_snapshot_id)
+            .await?;
+        let prefix = workspace_prefix_from_runtime_mount_path(&binding.mount_path);
+        let changed: Vec<GalvoFsDiffEntry> = diff
+            .changes
+            .into_iter()
+            .filter(|change| workspace_path_under_prefix(&change.path, &prefix))
+            .collect();
+
+        // A workspace file can vanish from the index — `rollback_workspace`
+        // replaces the map wholesale. Deleting somebody else's file because a
+        // rollback happened here is not a decision this call gets to make.
+        if let Some(removed) = changed
+            .iter()
+            .find(|change| change.kind == GalvoFsDiffKind::Removed)
+        {
+            return Err(GalvoFsError::AdmissionRejected(format!(
+                "GalvoFS writeback would have to delete {} at the source, which it will not do",
+                removed.path
+            )));
+        }
+
+        match binding.writeback_policy {
+            GalvoFsWritebackPolicy::PinArtifacts => {
+                self.writeback_pin_artifacts(&binding, &baseline_snapshot_id, &changed)
+                    .await
+            }
+            GalvoFsWritebackPolicy::External => {
+                self.writeback_external(&binding, &baseline_snapshot_id, &changed, &prefix)
+                    .await
+            }
+            // Refused above, before the diff was computed.
+            GalvoFsWritebackPolicy::None => unreachable!("writebackPolicy none is refused earlier"),
+        }
+    }
+
+    /// `PinArtifacts`: publish the changed files as immutable artifacts.
+    ///
+    /// Nothing outside this store is touched, so there is no drift to check and
+    /// no partial-push to describe.
+    async fn writeback_pin_artifacts(
+        &self,
+        binding: &GalvoFsStorageInputBinding,
+        baseline_snapshot_id: &str,
+        changed: &[GalvoFsDiffEntry],
+    ) -> GalvoFsResult<WritebackReport> {
+        let mut published = Vec::with_capacity(changed.len());
+        for change in changed {
+            published.push(
+                self.publish_artifact(PublishGalvoArtifactRequest {
+                    workspace_id: binding.workspace_id.clone(),
+                    path: change.path.clone(),
+                    content_type: None,
+                    retention_policy: binding.retention_policy.clone(),
+                })
+                .await?,
+            );
+        }
+        self.append_receipt(
+            StorageReceipt::new("storage-input.writeback")
+                .with_optional_lease(binding.lease_id.as_deref())
+                .with_storage_input(&binding.input_id)
+                .with_snapshot(baseline_snapshot_id),
+        )
+        .await?;
+
+        Ok(WritebackReport {
+            binding_id: binding.binding_id.clone(),
+            workspace_id: binding.workspace_id.clone(),
+            input_id: binding.input_id.clone(),
+            policy: binding.writeback_policy,
+            baseline_snapshot_id: baseline_snapshot_id.to_string(),
+            written_paths: Vec::new(),
+            published_artifacts: published,
+            completed_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    /// `External`: push the changed files back to the source directory.
+    ///
+    /// Local-path only. Every other source kind refuses by name rather than
+    /// silently doing nothing — S3-prefix and site-filesystem inputs have no
+    /// working materialization to write back to, so a stub here would be dead
+    /// code that reads as support.
+    async fn writeback_external(
+        &self,
+        binding: &GalvoFsStorageInputBinding,
+        baseline_snapshot_id: &str,
+        changed: &[GalvoFsDiffEntry],
+        prefix: &str,
+    ) -> GalvoFsResult<WritebackReport> {
+        if binding.source_kind != GalvoFsStorageInputSourceKind::LocalPath {
+            return Err(GalvoFsError::AdmissionRejected(format!(
+                "GalvoFS external writeback supports local-path sources only; binding {} is {:?}",
+                binding.binding_id, binding.source_kind
+            )));
+        }
+
+        let source = local_path_from_source_uri(&binding.source_uri)?;
+        let canonical_source = canonicalize_existing_path(&source).await?;
+        // Re-checked on the way out, not just on the way in. This call writes
+        // to a filesystem this process does not own, and an allowlist consulted
+        // only at attach time is an allowlist that stops applying the moment
+        // configuration changes.
+        self.validate_local_storage_input_allowlist(&canonical_source)
+            .await?;
+        let metadata = fs::symlink_metadata(&canonical_source)
+            .await
+            .map_err(|error| {
+                GalvoFsError::RuntimeFailed(format!(
+                    "failed to stat GalvoFS writeback target {}: {error}",
+                    canonical_source.display()
+                ))
+            })?;
+        if metadata.file_type().is_symlink() {
+            return Err(GalvoFsError::AdmissionRejected(
+                "GalvoFS writeback target must not be a symlink".into(),
+            ));
+        }
+
+        let targets =
+            resolve_writeback_targets(&canonical_source, metadata.is_dir(), prefix, changed)?;
+        assert_no_source_drift(&targets).await?;
+
+        let mut written_paths = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let bytes = self.object_store.get_object(&target.after_digest).await?;
+            write_external_file(&target.path, &bytes).await?;
+            written_paths.push(target.workspace_path.clone());
+        }
+
+        self.append_receipt(
+            StorageReceipt::new("storage-input.writeback")
+                .with_optional_lease(binding.lease_id.as_deref())
+                .with_storage_input(&binding.input_id)
+                .with_source_uri(&binding.source_uri)
+                .with_snapshot(baseline_snapshot_id),
+        )
+        .await?;
+
+        Ok(WritebackReport {
+            binding_id: binding.binding_id.clone(),
+            workspace_id: binding.workspace_id.clone(),
+            input_id: binding.input_id.clone(),
+            policy: binding.writeback_policy,
+            baseline_snapshot_id: baseline_snapshot_id.to_string(),
+            written_paths,
+            published_artifacts: Vec::new(),
+            completed_at: OffsetDateTime::now_utc(),
+        })
     }
 
     pub async fn publish_artifact(
@@ -2090,6 +2306,18 @@ pub struct GalvoFsStorageInputBinding {
     pub verification_status: GalvoFsInputVerificationStatus,
     pub retention_policy: String,
     pub writeback_policy: GalvoFsWritebackPolicy,
+    /// The workspace as it stood the moment this input finished materializing.
+    ///
+    /// Writeback compares against this to decide what the workspace changed and
+    /// whether the external source moved underneath it. Nothing else recorded
+    /// what a source looked like when it came in — `digestPolicy` and
+    /// `verificationStatus` were labels with no stored digest behind them — so
+    /// without this there is no baseline to detect drift against.
+    ///
+    /// Absent on bindings that never materialized, and on bindings written
+    /// before this field existed. Writeback refuses rather than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_snapshot_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub attached_at: OffsetDateTime,
 }
@@ -2465,6 +2693,29 @@ pub struct ArtifactManifest {
     pub published_at: OffsetDateTime,
 }
 
+/// What a writeback actually did.
+///
+/// `writtenPaths` is the point of this type. The outward push is N writes into
+/// storage this system does not own, and no local filesystem offers a
+/// transaction across them, so a failure part-way leaves a partial result. That
+/// cannot be designed away — but naming exactly which paths landed is the
+/// difference between a partial push and a silent one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WritebackReport {
+    pub binding_id: String,
+    pub workspace_id: String,
+    pub input_id: String,
+    pub policy: GalvoFsWritebackPolicy,
+    pub baseline_snapshot_id: String,
+    /// Paths written to the external source. Empty under `PinArtifacts`.
+    pub written_paths: Vec<String>,
+    /// Artifacts published. Empty under `External`.
+    pub published_artifacts: Vec<ArtifactManifest>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub completed_at: OffsetDateTime,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GalvoFsIntegrityReport {
@@ -2646,6 +2897,186 @@ struct WorkspaceState {
     /// it. Documents written before this field existed deserialize as 0.
     #[serde(default)]
     version: u64,
+}
+
+/// One file this writeback intends to place, and what it expects to find there.
+struct WritebackTarget {
+    workspace_path: String,
+    path: PathBuf,
+    after_digest: String,
+    /// The digest the source held at materialization. `None` means the
+    /// workspace added this file, so the source is expected to have nothing.
+    baseline_digest: Option<String>,
+}
+
+/// Is this workspace path inside the binding's mount prefix?
+///
+/// A bare `starts_with` would let `srcbackup/x` match the prefix `src`, which
+/// is a different directory. The boundary has to be a path separator.
+fn workspace_path_under_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Map each changed workspace path onto the file it came from.
+///
+/// Refuses anything it cannot map rather than guessing, and refuses any target
+/// that would land outside the source root even though workspace paths are
+/// normalized on the way in — this resolves into somebody else's filesystem, so
+/// the check is worth repeating where the write happens.
+fn resolve_writeback_targets(
+    source_root: &Path,
+    source_is_dir: bool,
+    prefix: &str,
+    changed: &[GalvoFsDiffEntry],
+) -> GalvoFsResult<Vec<WritebackTarget>> {
+    let mut targets = Vec::with_capacity(changed.len());
+    for change in changed {
+        let relative = if prefix.is_empty() {
+            change.path.as_str()
+        } else {
+            change
+                .path
+                .strip_prefix(prefix)
+                .unwrap_or(&change.path)
+                .trim_start_matches('/')
+        };
+        let after_digest = change.after_digest.clone().ok_or_else(|| {
+            GalvoFsError::RuntimeFailed(format!(
+                "GalvoFS writeback has no content digest for {}",
+                change.path
+            ))
+        })?;
+
+        // A single-file input materialized to exactly one workspace path. Any
+        // other path under the prefix did not come from this source, and
+        // inventing a sibling file next to somebody's file is not writeback.
+        let path = if source_is_dir {
+            source_root.join(relative)
+        } else if source_root.file_name().and_then(|name| name.to_str()) == Some(relative) {
+            source_root.to_path_buf()
+        } else {
+            return Err(GalvoFsError::AdmissionRejected(format!(
+                "GalvoFS writeback cannot map {} onto single-file source {}",
+                change.path,
+                source_root.display()
+            )));
+        };
+        if !path.starts_with(source_root) {
+            return Err(GalvoFsError::AdmissionRejected(format!(
+                "GalvoFS writeback path {} escapes its source root",
+                change.path
+            )));
+        }
+
+        targets.push(WritebackTarget {
+            workspace_path: change.path.clone(),
+            path,
+            after_digest,
+            baseline_digest: change.before_digest.clone(),
+        });
+    }
+    Ok(targets)
+}
+
+/// Refuse the whole writeback if the source moved since materialization.
+///
+/// Checked for every target before any of them is written, and one drifted
+/// path aborts all of them. Pushing the clean files and reporting the rest
+/// would be a partial application against storage this system does not own,
+/// which is the thing the whole design refuses to do.
+async fn assert_no_source_drift(targets: &[WritebackTarget]) -> GalvoFsResult<()> {
+    let mut drifted = Vec::new();
+    for target in targets {
+        let current = match fs::read(&target.path).await {
+            Ok(bytes) => Some(sha256_digest(&bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(GalvoFsError::RuntimeFailed(format!(
+                    "failed to read GalvoFS writeback target {}: {error}",
+                    target.path.display()
+                )));
+            }
+        };
+        match (&target.baseline_digest, &current) {
+            // Unchanged since materialization: safe to overwrite.
+            (Some(baseline), Some(current)) if baseline == current => {}
+            // The workspace added it and something else created it first.
+            (None, Some(_)) => drifted.push(format!(
+                "{} was created at the source after materialization",
+                target.workspace_path
+            )),
+            // Materialized from a file that has since been deleted.
+            (Some(_), None) => drifted.push(format!(
+                "{} was deleted at the source after materialization",
+                target.workspace_path
+            )),
+            (Some(_), Some(_)) => drifted.push(format!(
+                "{} was modified at the source after materialization",
+                target.workspace_path
+            )),
+            // Added here, absent there. Nothing to conflict with.
+            (None, None) => {}
+        }
+    }
+    if drifted.is_empty() {
+        return Ok(());
+    }
+    Err(GalvoFsError::AdmissionRejected(format!(
+        "GalvoFS writeback refused; the source changed since materialization: {}. Nothing was \
+         written.",
+        drifted.join("; ")
+    )))
+}
+
+/// Place one file at the source, via a temporary in the same directory.
+///
+/// This cannot make the writeback as a whole atomic — it is N writes into a
+/// directory we do not own, and no local filesystem offers a transaction across
+/// them. What it does buy is that no individual file is ever observed
+/// half-written by whatever else reads that directory.
+async fn write_external_file(path: &Path, bytes: &[u8]) -> GalvoFsResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        GalvoFsError::RuntimeFailed(format!(
+            "GalvoFS writeback target {} has no parent directory",
+            path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).await.map_err(|error| {
+        GalvoFsError::RuntimeFailed(format!(
+            "failed to create GalvoFS writeback directory: {error}"
+        ))
+    })?;
+    let temporary = parent.join(format!("{}.galvofs-writeback.tmp", Uuid::new_v4()));
+    if let Err(error) = write_and_sync(&temporary, bytes).await {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, path).await {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(GalvoFsError::RuntimeFailed(format!(
+            "failed to install GalvoFS writeback file {}: {error}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Pin a workspace state as a snapshot without re-reading it from disk.
+///
+/// `snapshot_workspace` reads the document; a caller mid-mutation holds a state
+/// the document does not yet have, and snapshotting through the disk would pin
+/// the wrong thing. Both paths build the pin here so they cannot drift.
+fn snapshot_from_state(state: &WorkspaceState, label: impl Into<String>) -> SnapshotPin {
+    SnapshotPin {
+        snapshot_id: format!("snap-{}", Uuid::new_v4()),
+        workspace_id: state.root.workspace_id.clone(),
+        label: label.into(),
+        files: state.files.values().cloned().collect(),
+        created_at: OffsetDateTime::now_utc(),
+    }
 }
 
 /// Exclusive hold on one workspace's metadata document.
