@@ -30,6 +30,10 @@ uploaded-object promotion landed in Femto.
   lock plus state version, closing a torn-document window and a lost-update
   race that silently discarded concurrent writes.
 - `commit_files`: several files installed as one unit, all or none.
+- Canonical storage input source URIs, content-derived input identity so a
+  retried create is idempotent, and `storage_inputs` for listing — previously
+  nothing could list them, so a client whose create timed out could not
+  discover whether it had landed.
 - Writeback, designed in `docs/architecture/galvofs-writeback.md` and
   implemented for local-path sources: a materialization baseline snapshot,
   explicit invocation only, refusal of the whole push if the source drifted
@@ -40,9 +44,13 @@ uploaded-object promotion landed in Femto.
 
 ## Next Work
 
-1. Storage input policy hardening: source URI normalization, idempotency,
-   duplicate detection, structured errors, and explicit verification
-   transitions.
+1. Storage input policy hardening — **structured errors** are what remains.
+   Source URI normalization, idempotency, and duplicate detection all shipped:
+   identity is derived from the normalized request content, so a retried create
+   resolves to the original rather than minting a second input, and changing the
+   `name` is how a caller asks for a genuinely new one. Explicit verification
+   transitions were already implemented before this item was written — see the
+   correction in `docs/architecture/galvofs-writeback.md`.
 2. Writeback for source kinds beyond local-path. The operation shipped for
    `LocalPath` only; every other kind refuses by name. `S3Prefix` and
    `SiteFilesystemReference` cannot be done before their import paths exist

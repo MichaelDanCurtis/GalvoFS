@@ -1610,3 +1610,141 @@ async fn galvofs_s3_prefix_normalization_preserves_a_meaningful_trailing_slash()
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// A retried create resolves to the input the first attempt made.
+///
+/// The create route is a plain POST with no idempotency key. A client that
+/// posted, timed out, and retried used to get a second input and no way to tell
+/// — nothing listed them. Identity is derived from the request content, so the
+/// retry lands on the original.
+#[tokio::test]
+async fn galvofs_repeating_a_storage_input_create_returns_the_original() {
+    let root = test_store_root("storage-input-idempotent");
+    let galvofs = GalvoFs::local(&root);
+
+    let first = galvofs
+        .create_storage_input(s3_storage_input_request())
+        .await
+        .expect("first create should be admitted");
+    let retry = galvofs
+        .create_storage_input(s3_storage_input_request())
+        .await
+        .expect("a retry should be admitted");
+
+    assert_eq!(
+        first.input_id, retry.input_id,
+        "a retried create minted a second input"
+    );
+    assert_eq!(
+        first.created_at, retry.created_at,
+        "the retry returned a rebuilt input rather than the stored one"
+    );
+
+    let listed = galvofs
+        .storage_inputs("tenant-alpha", "project-research")
+        .await
+        .expect("inputs should list");
+    assert_eq!(listed.len(), 1, "the store holds a duplicate: {listed:?}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Two spellings of one source are one input, because identity is computed over
+/// the NORMALIZED uri rather than the string the caller happened to type.
+#[tokio::test]
+async fn galvofs_storage_input_identity_follows_the_normalized_uri() {
+    let root = test_store_root("storage-input-identity-uri");
+    let source_root = root.join("allowed-inputs");
+    let dataset = source_root.join("dataset");
+    std::fs::create_dir_all(&dataset).expect("source dirs should create");
+    let galvofs = GalvoFs::local_with_storage_input_roots(&root, [source_root]);
+
+    let with_scheme = galvofs
+        .create_storage_input(local_path_import_request(format!(
+            "file://{}",
+            dataset.display()
+        )))
+        .await
+        .expect("first create should be admitted");
+    let bare_with_slash = galvofs
+        .create_storage_input(local_path_import_request(format!("{}/", dataset.display())))
+        .await
+        .expect("second create should be admitted");
+
+    assert_eq!(
+        with_scheme.input_id, bare_with_slash.input_id,
+        "two spellings of one directory produced two inputs"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Changing the name is how a caller says "another one, deliberately".
+///
+/// This is the escape hatch that makes returning the existing input safe: the
+/// server never has to guess whether a repeat means retry or intent, because
+/// the caller can express intent.
+#[tokio::test]
+async fn galvofs_a_differently_named_storage_input_is_a_new_one() {
+    let root = test_store_root("storage-input-rename");
+    let galvofs = GalvoFs::local(&root);
+
+    let first = galvofs
+        .create_storage_input(s3_storage_input_request())
+        .await
+        .expect("first create should be admitted");
+
+    let mut second_request = s3_storage_input_request();
+    second_request.name = "a-second-view-of-the-same-bucket".into();
+    let second = galvofs
+        .create_storage_input(second_request)
+        .await
+        .expect("a differently named create should be admitted");
+
+    assert_ne!(
+        first.input_id, second.input_id,
+        "a deliberate second input was collapsed onto the first"
+    );
+    let listed = galvofs
+        .storage_inputs("tenant-alpha", "project-research")
+        .await
+        .expect("inputs should list");
+    assert_eq!(listed.len(), 2);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Concurrent first creates must not both mint an input.
+///
+/// Both miss the index, both proceed. Without the identity lock the store keeps
+/// two inputs and one pointer, so one of them is unreachable by identity
+/// forever — a leak that only shows up under load. `join!` interleaves the two
+/// at their await points, so this reproduces deterministically.
+#[tokio::test]
+async fn galvofs_concurrent_storage_input_creates_produce_one_input() {
+    let root = test_store_root("storage-input-concurrent");
+    let galvofs = GalvoFs::local(&root);
+
+    let (left, right) = tokio::join!(
+        galvofs.create_storage_input(s3_storage_input_request()),
+        galvofs.create_storage_input(s3_storage_input_request()),
+    );
+    let left = left.expect("left create should be admitted");
+    let right = right.expect("right create should be admitted");
+
+    assert_eq!(
+        left.input_id, right.input_id,
+        "concurrent creates minted two inputs for one identity"
+    );
+    let listed = galvofs
+        .storage_inputs("tenant-alpha", "project-research")
+        .await
+        .expect("inputs should list");
+    assert_eq!(
+        listed.len(),
+        1,
+        "a concurrent create leaked an input the index cannot reach: {listed:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}

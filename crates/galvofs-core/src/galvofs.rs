@@ -537,12 +537,51 @@ impl GalvoFs {
         Ok(manifest)
     }
 
+    /// Admit a storage input, or hand back the one that already describes it.
+    ///
+    /// This is reachable over HTTP as a plain POST with no idempotency key, and
+    /// it used to mint a fresh id on every call. A client that posted, timed
+    /// out, and retried got two inputs — and could not tell, because nothing
+    /// listed them. Identity is now derived from the request content, so a
+    /// retry resolves to the input the first attempt created.
+    ///
+    /// Returning the existing input rather than refusing is a deliberate
+    /// departure from the refuse-rather-than-guess habit elsewhere in this
+    /// crate, and it is not really a guess: the caller asked for an input with
+    /// exactly these properties and gets one. The asymmetry decides it. A
+    /// refused retry leaves a client stuck — the create succeeded, it cannot
+    /// find out, and until `storage_inputs` existed it had nowhere to look. A
+    /// returned duplicate hands back something that does what was asked.
+    ///
+    /// `name` is part of the identity, which is the escape hatch: a caller that
+    /// genuinely wants a second input over the same source names it differently
+    /// and gets one. "Retry" and "another, please" stay distinguishable by the
+    /// caller instead of being guessed at by the server.
     pub async fn create_storage_input(
         &self,
         request: CreateGalvoStorageInputRequest,
     ) -> GalvoFsResult<GalvoFsStorageInput> {
         request.validate()?;
         self.ensure_metadata_dirs().await?;
+
+        let source_uri =
+            normalize_storage_input_source_uri(request.source_kind, &request.source_uri);
+        let identity = storage_input_identity(&request, &source_uri);
+        if let Some(existing) = self.storage_input_for_identity(&identity).await? {
+            return Ok(existing);
+        }
+
+        // Two concurrent first creates would both miss the check above and both
+        // write, leaving two inputs and one index entry pointing at whichever
+        // wrote last — the same lost-update shape as the workspace document.
+        let _lock = acquire_exclusive_lock(
+            &self.storage_input_identity_lock_path(&identity),
+            "GalvoFS storage input",
+        )
+        .await?;
+        if let Some(existing) = self.storage_input_for_identity(&identity).await? {
+            return Ok(existing);
+        }
 
         let input = GalvoFsStorageInput {
             input_id: format!("storage-input-{}", Uuid::new_v4()),
@@ -552,11 +591,10 @@ impl GalvoFs {
             source_kind: request.source_kind,
             // Stored canonical, not as typed. Everything downstream — receipts,
             // bindings, and any comparison between two inputs — then sees one
-            // spelling per source rather than one per caller.
-            source_uri: normalize_storage_input_source_uri(
-                request.source_kind,
-                &request.source_uri,
-            ),
+            // spelling per source rather than one per caller. This is also what
+            // the identity above was computed over, so two spellings of one
+            // source resolve to one input rather than two.
+            source_uri,
             materialization: request.materialization,
             access: request.access,
             mount_path: request.mount_path,
@@ -570,6 +608,16 @@ impl GalvoFs {
             created_at: OffsetDateTime::now_utc(),
         };
         write_json(&self.storage_input_path(&input.input_id), &input).await?;
+        // The index entry goes in AFTER the input it points at. The other order
+        // leaves a window where a concurrent reader resolves the identity to an
+        // input that is not on disk yet.
+        write_json(
+            &self.storage_input_index_path(&identity),
+            &StorageInputIndexEntry {
+                input_id: input.input_id.clone(),
+            },
+        )
+        .await?;
         self.append_receipt(
             StorageReceipt::new("storage-input.create")
                 .with_storage_input(&input.input_id)
@@ -578,6 +626,52 @@ impl GalvoFs {
         )
         .await?;
         Ok(input)
+    }
+
+    /// Every storage input admitted for a tenant and project.
+    ///
+    /// Nothing listed storage inputs before this. A client whose create timed
+    /// out had no way to discover whether it had landed, which is half of why
+    /// refusing a repeated create would have left callers stuck.
+    pub async fn storage_inputs(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> GalvoFsResult<Vec<GalvoFsStorageInput>> {
+        let mut inputs: Vec<GalvoFsStorageInput> =
+            read_json_dir::<GalvoFsStorageInput>(&self.storage_inputs_root())
+                .await?
+                .into_iter()
+                .filter(|input| input.tenant_id == tenant_id && input.project_id == project_id)
+                .collect();
+        inputs.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.input_id.cmp(&right.input_id))
+        });
+        Ok(inputs)
+    }
+
+    /// Resolve a content identity to the input it already produced, if any.
+    ///
+    /// A dangling index entry — pointing at an input whose document is missing —
+    /// is treated as absent rather than as an error, so a create can heal it by
+    /// writing a fresh input and overwriting the pointer.
+    async fn storage_input_for_identity(
+        &self,
+        identity: &str,
+    ) -> GalvoFsResult<Option<GalvoFsStorageInput>> {
+        let entry: StorageInputIndexEntry =
+            match read_json(&self.storage_input_index_path(identity)).await {
+                Ok(entry) => entry,
+                Err(GalvoFsError::ArtifactMissing(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        match self.read_storage_input(&entry.input_id).await {
+            Ok(input) => Ok(Some(input)),
+            Err(GalvoFsError::ArtifactMissing(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn attach_storage_input(
@@ -1567,6 +1661,7 @@ impl GalvoFs {
             self.workspaces_root(),
             self.leases_root(),
             self.storage_inputs_root(),
+            self.storage_input_index_root(),
             self.storage_input_materialization_tasks_root(),
             self.mount_manifests_root(),
             self.snapshots_root(),
@@ -1638,53 +1733,11 @@ impl GalvoFs {
     /// `create_new` is an atomic `O_EXCL` create, which is why this needs no
     /// locking dependency.
     async fn lock_workspace(&self, workspace_id: &str) -> GalvoFsResult<WorkspaceLock> {
-        let path = self.workspace_lock_path(workspace_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await.map_err(|error| {
-                GalvoFsError::RuntimeFailed(format!(
-                    "failed to create GalvoFS workspace lock path: {error}"
-                ))
-            })?;
-        }
-
-        let deadline = std::time::Instant::now() + WORKSPACE_LOCK_ACQUIRE_TIMEOUT;
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .await
-            {
-                Ok(mut file) => {
-                    let holder = format!(
-                        "pid={} acquiredAt={}",
-                        std::process::id(),
-                        OffsetDateTime::now_utc()
-                    );
-                    file.write_all(holder.as_bytes()).await.map_err(|error| {
-                        GalvoFsError::RuntimeFailed(format!(
-                            "failed to record GalvoFS workspace lock holder: {error}"
-                        ))
-                    })?;
-                    return Ok(WorkspaceLock { path });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if !break_stale_workspace_lock(&path).await?
-                        && std::time::Instant::now() >= deadline
-                    {
-                        return Err(GalvoFsError::Conflict(format!(
-                            "GalvoFS workspace {workspace_id} is locked by another writer"
-                        )));
-                    }
-                    tokio::time::sleep(WORKSPACE_LOCK_POLL_INTERVAL).await;
-                }
-                Err(error) => {
-                    return Err(GalvoFsError::RuntimeFailed(format!(
-                        "failed to lock GalvoFS workspace {workspace_id}: {error}"
-                    )));
-                }
-            }
-        }
+        acquire_exclusive_lock(
+            &self.workspace_lock_path(workspace_id),
+            &format!("GalvoFS workspace {workspace_id}"),
+        )
+        .await
     }
 
     async fn read_snapshot(&self, snapshot_id: &str) -> GalvoFsResult<SnapshotPin> {
@@ -1787,6 +1840,12 @@ impl GalvoFs {
         self.metadata_root().join("storage-inputs")
     }
 
+    /// Content-identity to input id, so a repeated create is O(1) rather than a
+    /// scan of every input ever admitted.
+    fn storage_input_index_root(&self) -> PathBuf {
+        self.metadata_root().join("storage-input-index")
+    }
+
     fn storage_input_materialization_tasks_root(&self) -> PathBuf {
         self.metadata_root().join("storage-input-materializations")
     }
@@ -1819,6 +1878,16 @@ impl GalvoFs {
 
     fn storage_input_path(&self, input_id: &str) -> PathBuf {
         self.storage_inputs_root().join(format!("{input_id}.json"))
+    }
+
+    fn storage_input_index_path(&self, identity: &str) -> PathBuf {
+        self.storage_input_index_root()
+            .join(format!("{identity}.json"))
+    }
+
+    fn storage_input_identity_lock_path(&self, identity: &str) -> PathBuf {
+        self.storage_input_index_root()
+            .join(format!("{identity}.lock"))
     }
 
     fn storage_input_materialization_task_path(&self, task_id: &str) -> PathBuf {
@@ -3097,6 +3166,101 @@ struct WorkspaceLock {
 impl Drop for WorkspaceLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The index entry mapping one content identity to the input it produced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StorageInputIndexEntry {
+    input_id: String,
+}
+
+/// What makes two storage inputs the same input.
+///
+/// Every field of the request that describes what the input IS, over the
+/// NORMALIZED source URI so three spellings of one directory hash alike. Fields
+/// are separated by a byte that cannot appear in any of them, because
+/// concatenating them raw would let ("ab", "c") and ("a", "bc") collide — two
+/// different inputs resolving to one, which is the one failure this must not
+/// have.
+///
+/// `name` is included on purpose. It is the caller's way to say "another one,
+/// deliberately" rather than "I am retrying".
+fn storage_input_identity(
+    request: &CreateGalvoStorageInputRequest,
+    normalized_uri: &str,
+) -> String {
+    let mut material = Vec::new();
+    for field in [
+        request.tenant_id.as_str(),
+        request.project_id.as_str(),
+        request.name.as_str(),
+        storage_input_source_kind_label(request.source_kind),
+        normalized_uri,
+        &format!("{:?}", request.materialization),
+        &format!("{:?}", request.access),
+        request.mount_path.as_str(),
+        &format!("{:?}", request.digest_policy),
+        request.retention_policy.as_str(),
+        &format!("{:?}", request.writeback_policy),
+    ] {
+        material.extend_from_slice(field.as_bytes());
+        material.push(0);
+    }
+    hex_sha256(&material)
+}
+
+/// Take an exclusive lock at `path`, releasing it on drop.
+///
+/// `create_new` is an atomic `O_EXCL` create, which is why this needs no
+/// locking dependency. `label` names the thing being locked so a contended or
+/// broken lock says which one.
+async fn acquire_exclusive_lock(path: &Path, label: &str) -> GalvoFsResult<WorkspaceLock> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await.map_err(|error| {
+            GalvoFsError::RuntimeFailed(format!("failed to create GalvoFS lock path: {error}"))
+        })?;
+    }
+
+    let deadline = std::time::Instant::now() + WORKSPACE_LOCK_ACQUIRE_TIMEOUT;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await
+        {
+            Ok(mut file) => {
+                let holder = format!(
+                    "pid={} acquiredAt={}",
+                    std::process::id(),
+                    OffsetDateTime::now_utc()
+                );
+                file.write_all(holder.as_bytes()).await.map_err(|error| {
+                    GalvoFsError::RuntimeFailed(format!(
+                        "failed to record GalvoFS lock holder: {error}"
+                    ))
+                })?;
+                return Ok(WorkspaceLock {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !break_stale_workspace_lock(path).await? && std::time::Instant::now() >= deadline
+                {
+                    return Err(GalvoFsError::Conflict(format!(
+                        "{label} is locked by another writer"
+                    )));
+                }
+                tokio::time::sleep(WORKSPACE_LOCK_POLL_INTERVAL).await;
+            }
+            Err(error) => {
+                return Err(GalvoFsError::RuntimeFailed(format!(
+                    "failed to lock {label}: {error}"
+                )));
+            }
+        }
     }
 }
 
